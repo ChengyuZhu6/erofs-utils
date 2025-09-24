@@ -1497,12 +1497,12 @@ int ocierofs_io_open(struct erofs_vfile *vfile, const struct ocierofs_config *cf
 		return err;
 	}
 
-	err = ocierofs_is_erofs_native_image(ctx);
-	if (err) {
-		ocierofs_ctx_cleanup(ctx);
-		free(ctx);
-		return err;
-	}
+	// err = ocierofs_is_erofs_native_image(ctx);
+	// if (err) {
+	// 	ocierofs_ctx_cleanup(ctx);
+	// 	free(ctx);
+	// 	return err;
+	// }
 
 	oci_iostream = calloc(1, sizeof(*oci_iostream));
 	if (!oci_iostream) {

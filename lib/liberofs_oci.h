@@ -35,6 +35,8 @@ struct ocierofs_config {
 	char *password;
 	char *blob_digest;
 	int layer_index;
+	char *local_meta_path;
+	char *zinfo_path;
 };
 
 struct ocierofs_layer_info {

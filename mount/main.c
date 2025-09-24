@@ -16,6 +16,7 @@
 #include "erofs/io.h"
 #include "../lib/liberofs_nbd.h"
 #include "../lib/liberofs_oci.h"
+#include "../lib/liberofs_gzran.h"
 #ifdef HAVE_LINUX_LOOP_H
 #include <linux/loop.h>
 #else
@@ -141,7 +142,25 @@ static int erofsmount_parse_oci_option(const char *option)
 						if (!oci_cfg->password)
 							return -ENOMEM;
 					} else {
-						return -EINVAL;
+						p = strstr(option, "oci.local_meta=");
+						if (p != NULL) {
+							p += strlen("oci.local_meta=");
+							free(oci_cfg->local_meta_path);
+							oci_cfg->local_meta_path = strdup(p);
+							if (!oci_cfg->local_meta_path)
+								return -ENOMEM;
+						} else {
+							p = strstr(option, "oci.zinfo=");
+							if (p != NULL) {
+								p += strlen("oci.zinfo=");
+								free(oci_cfg->zinfo_path);
+								oci_cfg->zinfo_path = strdup(p);
+								if (!oci_cfg->zinfo_path)
+									return -ENOMEM;
+							} else {
+								return -EINVAL;
+							}
+						}
 					}
 				}
 			}
@@ -332,20 +351,280 @@ static int erofsmount_fuse(const char *source, const char *mountpoint,
 	return 0;
 }
 
+struct erofs_hybrid_source {
+	struct erofs_vfile local_vf;       /* 本地元数据 */
+	struct erofs_vfile *gzran_vf;      /* gzran 远程数据 */
+	u64 local_size;                    /* 本地数据大小 */
+};
+
 struct erofsmount_nbd_ctx {
 	struct erofs_vfile vd;		/* virtual device */
 	struct erofs_vfile sk;		/* socket file */
 };
 
+static ssize_t erofs_hybrid_pread(struct erofs_vfile *vf, void *buf, 
+				  size_t count, u64 offset)
+{
+	struct erofs_hybrid_source *hs;
+	ssize_t bytes_read;
+	
+	if (count > (1ULL << 22)) {
+		fprintf(stderr, "WARNING: Request too large: len=%zu\n", count);
+		return -EINVAL;
+	}
+	
+	hs = *(struct erofs_hybrid_source **)vf->payload;
+	
+	if (!hs) {
+		fprintf(stderr, "ERROR: Failed to get hybrid source from vf payload\n");
+		return -EINVAL;
+	}
+	
+	fprintf(stderr, "DEBUG: Hybrid request: pos=%llu, len=%zu, local_size=%llu\n", 
+		(unsigned long long)offset, count, (unsigned long long)hs->local_size);
+	
+	/* 处理设备边界探测请求 */
+	if (offset >= (1ULL << 50))
+		return 0;
+	
+	if (hs->local_size == 0) {
+		fprintf(stderr, "DEBUG: Pure remote request: pos=%llu, len=%zu\n", 
+			(unsigned long long)offset, count);
+		bytes_read = hs->gzran_vf->ops->pread(hs->gzran_vf, buf, count, offset);
+		return bytes_read;
+	}
+	
+	if (offset >= hs->local_size) {
+		u64 remote_offset = offset - hs->local_size;
+
+		fprintf(stderr, "DEBUG: Remote request: original_pos=%llu, adjusted_pos=%llu\n", 
+			(unsigned long long)offset, (unsigned long long)remote_offset);
+		if (remote_offset > (1ULL << 40)) {
+			fprintf(stderr, "DEBUG: Remote offset %llu beyond range, returning 0 bytes\n", (unsigned long long)remote_offset);
+			return 0;
+		}
+		
+		bytes_read = hs->gzran_vf->ops->pread(hs->gzran_vf, buf, count, remote_offset);
+		return bytes_read;
+		
+	} else if (offset + count <= hs->local_size) {
+		fprintf(stderr, "DEBUG: Local request: pos=%llu, len=%zu\n", 
+			(unsigned long long)offset, count);
+		return erofs_io_pread(&hs->local_vf, buf, count, offset);
+	} else {
+		/* 跨越本地和远程数据 */
+		u64 local_part = hs->local_size - offset;
+		u64 remote_part = count - local_part;
+		ssize_t local_read, remote_read;
+		
+		fprintf(stderr, "DEBUG: Spanning request: local_part=%llu, remote_part=%llu\n", 
+			(unsigned long long)local_part, (unsigned long long)remote_part);
+		
+		if (remote_part > (1ULL << 22)) {
+			fprintf(stderr, "ERROR: Remote part too large: %llu\n", (unsigned long long)remote_part);
+			return -EINVAL;
+		}
+		
+		local_read = erofs_io_pread(&hs->local_vf, buf, local_part, offset);
+		if (local_read < 0) return local_read;
+		
+		remote_read = hs->gzran_vf->ops->pread(hs->gzran_vf, 
+						      (char*)buf + local_read, 
+						      remote_part, 0);
+		if (remote_read < 0) return remote_read;
+		
+		return local_read + remote_read;
+	}
+}
+
+static void erofs_hybrid_close(struct erofs_vfile *vf)
+{
+	struct erofs_hybrid_source *hs;
+	
+	if (!vf) {
+		fprintf(stderr, "WARNING: Attempting to close NULL vf\n");
+		return;
+	}
+
+	hs = *(struct erofs_hybrid_source **)vf->payload;
+	if (!hs) {
+		fprintf(stderr, "WARNING: Failed to get hybrid source from vf payload in close\n");
+		return;
+	}
+
+	if (hs->local_size > 0) {
+		erofs_io_close(&hs->local_vf);
+	}
+
+	if (hs->gzran_vf) {
+		erofs_io_close(hs->gzran_vf);
+	}
+
+	free(hs);
+}
+
+static int load_file_to_buf(const char *path, void **out, unsigned int *out_len)
+{
+	FILE *fp = NULL;
+	void *buf = NULL;
+	int ret = 0;
+
+	if (!path || !out || !out_len)
+		return -EINVAL;
+
+	fp = fopen(path, "rb");
+	if (!fp)
+		return -errno;
+
+	if (fseek(fp, 0, SEEK_END) != 0) { ret = -errno; goto out; }
+	long sz = ftell(fp);
+	if (sz < 0) { ret = -errno; goto out; }
+	if (fseek(fp, 0, SEEK_SET) != 0) { ret = -errno; goto out; }
+	if (sz == 0) { ret = -EINVAL; goto out; }
+
+	buf = malloc((size_t)sz);
+	if (!buf) { ret = -ENOMEM; goto out; }
+
+	size_t n = fread(buf, 1, (size_t)sz, fp);
+	if (n != (size_t)sz) { ret = -EIO; goto out; }
+
+	*out = buf;
+	*out_len = (unsigned int)sz;
+	buf = NULL;
+
+out:
+	if (fp) fclose(fp);
+	if (ret < 0 && buf) free(buf);
+	return ret;
+}
+
+static int erofsmount_init_gzran(struct erofs_vfile **gzran_vf,
+				  const struct ocierofs_config *oci_cfg,
+				  const char *zinfo_path)
+{
+	int err = 0;
+	void *zinfo_data = NULL;
+	unsigned int zinfo_len = 0;
+	struct erofs_vfile *oci_vf = NULL;
+
+	if (!gzran_vf || !zinfo_path || !oci_cfg)
+		return -EINVAL;
+
+	*gzran_vf = NULL;
+
+	err = load_file_to_buf(zinfo_path, &zinfo_data, &zinfo_len);
+	if (err) {
+		erofs_err("Failed to load zinfo from %s: %s", 
+			  zinfo_path, erofs_strerror(err));
+		return err;
+	}
+
+	oci_vf = malloc(sizeof(*oci_vf));
+	if (!oci_vf) {
+		err = -ENOMEM;
+		goto cleanup;
+	}
+
+	err = ocierofs_io_open(oci_vf, oci_cfg);
+	if (err) {
+		free(oci_vf);
+		goto cleanup;
+	}
+
+	*gzran_vf = erofs_gzran_zinfo_open(oci_vf, zinfo_data, zinfo_len);
+	if (IS_ERR(*gzran_vf)) {
+		err = PTR_ERR(*gzran_vf);
+		erofs_err("Failed to initialize gzran: %s", erofs_strerror(err));
+		*gzran_vf = NULL;
+		erofs_io_close(oci_vf);
+		free(oci_vf);
+		goto cleanup;
+	}
+
+	free(zinfo_data);
+	return 0;
+
+cleanup:
+	if (zinfo_data)
+		free(zinfo_data);
+	return err;
+}
+
+static struct erofs_vfops hybrid_vfile_ops = {
+	.pread = erofs_hybrid_pread,
+	.close = erofs_hybrid_close,
+};
+
+static int erofs_create_hybrid_source(struct erofs_vfile *out_vf,
+				      const struct ocierofs_config *oci_cfg,
+				      const char *local_meta_path,
+				      const char *zinfo_path)
+{
+	struct erofs_hybrid_source *hs;
+	int err;
+	
+	hs = calloc(1, sizeof(*hs));
+	if (!hs) return -ENOMEM;
+	
+	if (local_meta_path) {
+		hs->local_vf.fd = open(local_meta_path, O_RDONLY);
+		if (hs->local_vf.fd < 0) {
+			err = -errno;
+			erofs_err("Failed to open local metadata file: %s", local_meta_path);
+			goto cleanup;
+		}
+		
+		hs->local_vf.ops = NULL;
+		hs->local_vf.offset = 0;
+		
+		struct stat st;
+		if (fstat(hs->local_vf.fd, &st) < 0) {
+			err = -errno;
+			erofs_err("Failed to get metadata file size");
+			goto cleanup;
+		}
+		hs->local_size = st.st_size;
+		
+		fprintf(stderr, "DEBUG: Hybrid source initialized with local metadata: %s, size=%llu\n",
+			local_meta_path, (unsigned long long)hs->local_size);
+	}
+	
+	if (zinfo_path) {
+		err = erofsmount_init_gzran(&hs->gzran_vf, oci_cfg, zinfo_path);
+		if (err) {
+			erofs_err("Failed to initialize gzran for hybrid source");
+			goto cleanup;
+		}
+		
+		fprintf(stderr, "DEBUG: Hybrid source initialized with gzran: %s\n", zinfo_path);
+	}
+	
+	out_vf->ops = &hybrid_vfile_ops;
+	out_vf->fd = 0;
+	out_vf->offset = 0;
+	*(struct erofs_hybrid_source **)out_vf->payload = hs;
+	
+	return 0;
+	
+cleanup:
+	if (local_meta_path && hs->local_vf.fd >= 0) {
+		close(hs->local_vf.fd);
+	}
+	free(hs);
+	return err;
+}
+
 static void *erofsmount_nbd_loopfn(void *arg)
 {
 	struct erofsmount_nbd_ctx *ctx = arg;
-	int err;
+	int err = 0;
+
+	fprintf(stderr, "DEBUG: NBD worker thread started\n");
 
 	while (1) {
 		struct erofs_nbd_request rq;
-		ssize_t rem;
-		off_t pos;
+		char *buf = NULL;
+		ssize_t bytes_read;
 
 		err = erofs_nbd_get_request(ctx->sk.fd, &rq);
 		if (err < 0) {
@@ -354,27 +633,53 @@ static void *erofsmount_nbd_loopfn(void *arg)
 			break;
 		}
 
+		fprintf(stderr, "DEBUG: NBD request: type=%u, pos=%llu, len=%u\n", 
+			rq.type, (unsigned long long)rq.from, rq.len);
+
 		if (rq.type != EROFS_NBD_CMD_READ) {
-			err = erofs_nbd_send_reply_header(ctx->sk.fd,
-						rq.cookie, -EIO);
+			err = erofs_nbd_send_reply_header(ctx->sk.fd, rq.cookie, -EIO);
 			if (err)
 				break;
+			continue;
 		}
 
-		erofs_nbd_send_reply_header(ctx->sk.fd, rq.cookie, 0);
-		pos = rq.from;
-		rem = erofs_io_sendfile(&ctx->sk, &ctx->vd, &pos, rq.len);
-		if (rem < 0) {
-			err = -errno;
+		err = erofs_nbd_send_reply_header(ctx->sk.fd, rq.cookie, 0);
+		if (err)
+			break;
+
+		buf = malloc(rq.len);
+		if (!buf) {
+			err = -ENOMEM;
 			break;
 		}
-		err = __erofs_0write(ctx->sk.fd, rem);
+
+		bytes_read = ctx->vd.ops->pread(&ctx->vd, buf, rq.len, rq.from);
+		if (bytes_read < 0) {
+			free(buf);
+			err = bytes_read;
+			break;
+		}
+
+		if (bytes_read > 0) {
+			ssize_t written = write(ctx->sk.fd, buf, bytes_read);
+			if (written != bytes_read) {
+				free(buf);
+				err = -EIO;
+				break;
+			}
+		}
+		free(buf);
+
+		err = __erofs_0write(ctx->sk.fd, rq.len - bytes_read);
 		if (err) {
 			if (err > 0)
 				err = -EIO;
 			break;
 		}
 	}
+
+	fprintf(stderr, "DEBUG: NBD worker thread exiting with code %d\n", err);
+	
 	erofs_io_close(&ctx->vd);
 	erofs_io_close(&ctx->sk);
 	return (void *)(uintptr_t)err;
@@ -388,9 +693,19 @@ static int erofsmount_startnbd(int nbdfd, struct erofs_nbd_source *source)
 	int err, err2;
 
 	if (source->type == EROFSNBD_SOURCE_OCI) {
-		err = ocierofs_io_open(&ctx.vd, &source->ocicfg);
-		if (err)
-			goto out_closefd;
+		if (source->ocicfg.local_meta_path || source->ocicfg.zinfo_path) {
+			err = erofs_create_hybrid_source(&ctx.vd, &source->ocicfg,
+							source->ocicfg.local_meta_path,
+							source->ocicfg.zinfo_path);
+			if (err) {
+				erofs_err("Failed to create hybrid data source");
+				goto out_closefd;
+			}
+		} else {
+			err = ocierofs_io_open(&ctx.vd, &source->ocicfg);
+			if (err)
+				goto out_closefd;
+		}
 	} else {
 		err = open(source->device_path, O_RDONLY);
 		if (err < 0) {
@@ -440,6 +755,22 @@ static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *sourc
 			return PTR_ERR(b64cred);
 	}
 
+	/* 检查是否是gzran+oci混合模式 */
+	if ((source->ocicfg.local_meta_path || source->ocicfg.zinfo_path) && 
+	    source->ocicfg.blob_digest && *source->ocicfg.blob_digest) {
+		/* GZRAN_OCI_BLOB模式：gzran + oci blob混合 */
+		ret = fprintf(f, "GZRAN_OCI_BLOB %s %s %s %s %s %s\n",
+			      source->ocicfg.image_ref ?: "",
+			      source->ocicfg.platform ?: "",
+			      source->ocicfg.blob_digest,
+			      b64cred ?: "",
+			      source->ocicfg.local_meta_path ?: "",
+			      source->ocicfg.zinfo_path ?: "");
+		free(b64cred);
+		return ret < 0 ? -ENOMEM : 0;
+	}
+	
+	/* 标准OCI模式 */
 	if (source->ocicfg.blob_digest && *source->ocicfg.blob_digest) {
 		ret = fprintf(f, "OCI_NATIVE_BLOB %s %s %s %s\n",
 			      source->ocicfg.image_ref ?: "",
@@ -479,10 +810,19 @@ static int erofsmount_write_recovery_local(FILE *f, struct erofs_nbd_source *sou
 	if (!realp)
 		return -errno;
 
-	/* TYPE<LOCAL> <SOURCE PATH>\n(more..) */
-	err = fprintf(f, "LOCAL %s\n", realp) < 0;
-	free(realp);
-	return err ? -ENOMEM : 0;
+	if (source->ocicfg.zinfo_path) {
+		err = fprintf(f, "GZRAN_LOCAL %s %s\n", realp, source->ocicfg.zinfo_path) < 0;
+		free(realp);
+		if (err)
+			return -ENOMEM;
+	} else {
+		err = fprintf(f, "LOCAL %s\n", realp) < 0;
+		free(realp);
+		if (err)
+			return -ENOMEM;
+	}
+	
+	return 0;
 }
 
 static char *erofsmount_write_recovery_info(struct erofs_nbd_source *source)
@@ -674,20 +1014,30 @@ static int erofsmount_startnbd_nl(pid_t *pid, struct erofs_nbd_source *source)
 		struct erofsmount_nbd_ctx ctx = {};
 		char *recp;
 
-		/* Otherwise, NBD disconnect sends SIGPIPE, skipping cleanup */
 		if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
 			exit(EXIT_FAILURE);
 
 		if (source->type == EROFSNBD_SOURCE_OCI) {
-			err = ocierofs_io_open(&ctx.vd, &source->ocicfg);
-			if (err)
-				exit(EXIT_FAILURE);
+			if (source->ocicfg.local_meta_path || source->ocicfg.zinfo_path) {
+				err = erofs_create_hybrid_source(&ctx.vd, &source->ocicfg,
+								source->ocicfg.local_meta_path,
+								source->ocicfg.zinfo_path);
+				if (err) {
+					erofs_err("Failed to create hybrid data source");
+					exit(EXIT_FAILURE);
+				}
+			} else {
+				err = ocierofs_io_open(&ctx.vd, &source->ocicfg);
+				if (err)
+					exit(EXIT_FAILURE);
+			}
 		} else {
 			err = open(source->device_path, O_RDONLY);
 			if (err < 0)
 				exit(EXIT_FAILURE);
 			ctx.vd.fd = err;
 		}
+
 		recp = erofsmount_write_recovery_info(source);
 		if (IS_ERR(recp)) {
 			erofs_io_close(&ctx.vd);
@@ -774,7 +1124,6 @@ static int erofsmount_reattach(const char *target)
 		fclose(f);
 		goto err_identifier;
 	}
-	fclose(f);
 	if (err && line[err - 1] == '\n')
 		line[err - 1] = '\0';
 
@@ -787,21 +1136,110 @@ static int erofsmount_reattach(const char *target)
 		*(source++) = '\0';
 	}
 
+	while ((err = getline(&line, &n, f)) > 0) {
+	}
+	fclose(f);
+
+
 	if (!strcmp(line, "LOCAL")) {
 		err = open(source, O_RDONLY);
 		if (err < 0) {
 			err = -errno;
-			goto err_line;
+			goto err_cleanup;
 		}
 		ctx.vd.fd = err;
+	} else if (!strcmp(line, "GZRAN_LOCAL")) {
+		char *local_path = source;
+		char *space = strchr(source, ' ');
+		char *zinfo_from_line = NULL;
+		
+		if (!space) {
+			erofs_err("Invalid GZRAN_LOCAL format: missing zinfo path");
+			err = -EINVAL;
+			goto err_cleanup;
+		}
+		
+		*space = '\0';
+		zinfo_from_line = space + 1;
+		
+		struct ocierofs_config oci_cfg = {};
+		oci_cfg.image_ref = strdup(local_path);
+		
+		err = erofs_create_hybrid_source(&ctx.vd, &oci_cfg,
+						local_path, zinfo_from_line);
+		free(oci_cfg.image_ref);
+		if (err) {
+			erofs_err("Failed to create hybrid data source for GZRAN_LOCAL reattach");
+			goto err_cleanup;
+		}
+	} else if (!strcmp(line, "GZRAN_OCI_BLOB")) {
+		char *tokens[6] = {0};
+		char *p = source;
+		int token_count = 0;
+		
+		while (token_count < 5) {
+			char *space = strchr(p, ' ');
+			if (!space) break;
+			
+			*space = '\0';
+			p = space + 1;
+			
+			tokens[token_count++] = p;
+		}
+		
+		fprintf(stderr, "DEBUG: GZRAN_OCI_BLOB parsed tokens: count=%d\n", token_count);
+		for (int i = 0; i < token_count; i++) {
+			fprintf(stderr, "  tokens[%d] = '%s'\n", i, tokens[i] ? tokens[i] : "(null)");
+		}
+		
+		if (token_count < 5) {
+			erofs_err("Invalid GZRAN_OCI_BLOB format: need 6 parameters, got %d", token_count + 1);
+			err = -EINVAL;
+			goto err_cleanup;
+		}
+		
+		char oci_source[1024];
+		const char *b64cred = (token_count > 2 && tokens[2]) ? tokens[2] : "";
+		snprintf(oci_source, sizeof(oci_source), "%s %s %s %s", 
+			source, tokens[0], tokens[1], b64cred);
+		
+		fprintf(stderr, "DEBUG: Calling erofsmount_reattach_oci with: '%s'\n", oci_source);
+		
+		err = erofsmount_reattach_oci(&ctx.vd, "OCI_NATIVE_BLOB", oci_source);
+		if (err) {
+			erofs_err("Failed to parse OCI config for GZRAN_OCI_BLOB reattach");
+			goto err_cleanup;
+		}
+		
+		struct erofs_vfile temp_vd = ctx.vd;
+		struct ocierofs_config oci_cfg = {};
+		oci_cfg.image_ref = strdup(source);
+		
+		char *local_meta_from_line = (token_count > 3 && tokens[3] && strlen(tokens[3]) > 0) ? tokens[3] : NULL;
+		char *zinfo_from_line = (token_count > 4 && tokens[4] && strlen(tokens[4]) > 0) ? tokens[4] : NULL;
+		
+		fprintf(stderr, "DEBUG: Creating hybrid source with local_meta='%s', zinfo='%s'\n",
+			local_meta_from_line ? local_meta_from_line : "(null)",
+			zinfo_from_line ? zinfo_from_line : "(null)");
+		
+		err = erofs_create_hybrid_source(&ctx.vd, &oci_cfg,
+						local_meta_from_line, zinfo_from_line);
+		free(oci_cfg.image_ref);
+		
+		erofs_io_close(&temp_vd);
+		
+		if (err) {
+			erofs_err("Failed to create hybrid data source for GZRAN_OCI_BLOB reattach");
+			goto err_cleanup;
+		}
 	} else if (!strcmp(line, "OCI_LAYER") || !strcmp(line, "OCI_NATIVE_BLOB")) {
 		err = erofsmount_reattach_oci(&ctx.vd, line, source);
 		if (err)
-			goto err_line;
+			goto err_cleanup;
 	} else {
 		err = -EOPNOTSUPP;
 		erofs_err("unsupported source type %s recorded in recovery file", line);
-		goto err_line;
+		goto err_cleanup;
 	}
 
 	err = erofs_nbd_nl_reconnect(nbdnum, identifier);
@@ -818,6 +1256,7 @@ static int erofsmount_reattach(const char *target)
 		err = 0;
 	}
 	erofs_io_close(&ctx.vd);
+err_cleanup:
 err_line:
 	free(line);
 err_identifier:

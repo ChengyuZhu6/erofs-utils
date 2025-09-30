@@ -218,6 +218,8 @@ static void usage(int argc, char **argv)
 		"   [,blob=Y]           Y=blob digest to extract (omit to extract all layers)\n"
 		"   [,username=Z]       Z=username for authentication (optional)\n"
 		"   [,password=W]       W=password for authentication (optional)\n"
+		"   [,i]                generate tarindex file (requires layer or blob selection)\n"
+
 #endif
 		" --tar=X               generate a full or index-only image from a tarball(-ish) source\n"
 		"                       (X = f|i|headerball; f=full mode, i=index mode,\n"
@@ -285,7 +287,7 @@ static struct erofs_s3 s3cfg;
 
 #ifdef OCIEROFS_ENABLED
 static struct ocierofs_config ocicfg;
-static char *mkfs_oci_options;
+static bool mkfs_oci_tarindex_mode;
 #endif
 
 enum {
@@ -727,7 +729,7 @@ static int mkfs_parse_s3_cfg(char *cfg_str)
  * @options_str: comma-separated options string
  *
  * Parse OCI options string containing comma-separated key=value pairs.
- * Supported options include platform, blob, layer, username, and password.
+ * Supported options include platform, blob, layer, username, password, i (tarindex mode), and zinfo.
  *
  * Return: 0 on success, negative errno on failure
  */
@@ -744,6 +746,7 @@ static int mkfs_parse_oci_options(struct ocierofs_config *oci_cfg, char *options
 		q = strchr(opt, ',');
 		if (q)
 			*q = '\0';
+
 
 		p = strstr(opt, "platform=");
 		if (p) {
@@ -790,19 +793,23 @@ static int mkfs_parse_oci_options(struct ocierofs_config *oci_cfg, char *options
 						oci_cfg->username = strdup(p);
 						if (!oci_cfg->username)
 							return -ENOMEM;
+					} else {
+						p = strstr(opt, "password=");
+						if (p) {
+							p += strlen("password=");
+							free(oci_cfg->password);
+							oci_cfg->password = strdup(p);
+							if (!oci_cfg->password)
+								return -ENOMEM;
+						} else {
+							if (!strcmp(opt, "i"))
+								mkfs_oci_tarindex_mode = true;
+							else{
+								erofs_err("mkfs: invalid --oci value %s", opt);
+								return -EINVAL;
+							}
+						}
 					}
-
-					p = strstr(opt, "password=");
-					if (p) {
-						p += strlen("password=");
-						free(oci_cfg->password);
-						oci_cfg->password = strdup(p);
-						if (!oci_cfg->password)
-							return -ENOMEM;
-					}
-
-					erofs_err("mkfs: invalid --oci value %s", opt);
-					return -EINVAL;
 				}
 			}
 		}
@@ -1378,10 +1385,13 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			break;
 #endif
 #ifdef OCIEROFS_ENABLED
-		case 534:
-			mkfs_oci_options = optarg;
+		case 534: {
 			source_mode = EROFS_MKFS_SOURCE_OCI;
+			err = mkfs_parse_oci_options(&ocicfg, optarg);
+			if (err)
+				return err;
 			break;
+		}
 #endif
 		case 535:
 			if (optarg)
@@ -1757,6 +1767,9 @@ int main(int argc, char **argv)
 			goto exit;
 		}
 		mkfs_blkszbits = src->blkszbits;
+	} else if (mkfs_oci_tarindex_mode) {
+		mkfs_blkszbits = 9;
+		tar_index_512b = true;
 	}
 
 	if (!incremental_mode)
@@ -1883,13 +1896,11 @@ int main(int argc, char **argv)
 #endif
 #ifdef OCIEROFS_ENABLED
 		} else if (source_mode == EROFS_MKFS_SOURCE_OCI) {
-			ocicfg.blob_digest = NULL;
-			ocicfg.layer_index = -1;
-
-			err = mkfs_parse_oci_options(&ocicfg, mkfs_oci_options);
-			if (err)
-				goto exit;
 			ocicfg.image_ref = cfg.c_src_path;
+			if (mkfs_oci_tarindex_mode)
+				ocicfg.tarindex_path = strdup(cfg.c_src_path);
+			if (!ocicfg.zinfo_path)
+				ocicfg.zinfo_path = mkfs_aws_zinfo_file;
 
 			if (incremental_mode ||
 			    dataimport_mode == EROFS_MKFS_DATA_IMPORT_RVSP ||
@@ -1914,10 +1925,12 @@ int main(int argc, char **argv)
 		if (!g_sbi.extra_devices) {
 			DBG_BUGON(1);
 		} else {
-			if (cfg.c_src_path)
-				g_sbi.devs[0].src_path = strdup(cfg.c_src_path);
-			g_sbi.devs[0].blocks =
-				BLK_ROUND_UP(&g_sbi, erofstar.offset);
+			if (source_mode != EROFS_MKFS_SOURCE_OCI) {
+				if (cfg.c_src_path)
+					g_sbi.devs[0].src_path = strdup(cfg.c_src_path);
+				g_sbi.devs[0].blocks =
+					BLK_ROUND_UP(&g_sbi, erofstar.offset);
+			}
 		}
 	}
 

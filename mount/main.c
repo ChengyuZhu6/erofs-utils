@@ -114,8 +114,10 @@ static int erofsmount_parse_oci_option(const char *option)
 				return -EINVAL;
 			}
 			idx = strtol(p, NULL, 10);
-			if (idx < 0)
+			if (idx < 0) {
+				printf("invalid oci.layer index: %ld\n", idx);
 				return -EINVAL;
+			}
 			oci_cfg->layer_index = (int)idx;
 		} else {
 			p = strstr(option, "oci.platform=");
@@ -212,8 +214,10 @@ static long erofsmount_parse_flagopts(char *s, long flags, char **more)
 				nbdsrc.ocicfg.layer_index = -1;
 			}
 			err = erofsmount_parse_oci_option(s);
-			if (err < 0)
+			if (err < 0) {
+				printf("failed to parse OCI option segment '%s': %s\n", s, erofs_strerror(err));
 				return err;
+			}
 		} else {
 			for (i = 0; i < ARRAY_SIZE(opts); ++i) {
 				if (!strcasecmp(s, opts[i].name)) {
@@ -460,8 +464,10 @@ static int load_file_to_buf(const char *path, void **out, unsigned int *out_len)
 	size_t num;
 
 	fp = fopen(path, "rb");
-	if (!fp)
+	if (!fp) {
+		printf("failed to open file '%s': %s\n", path, strerror(errno));
 		return -errno;
+	}
 
 	if (fseek(fp, 0, SEEK_END) != 0) {
 		ret = -errno;
@@ -474,6 +480,7 @@ static int load_file_to_buf(const char *path, void **out, unsigned int *out_len)
 	}
 	rewind(fp);
 	if (!sz) {
+		printf("file '%s' is empty\n", path);
 		ret = -EINVAL;
 		goto out;
 	}
@@ -516,18 +523,21 @@ static int erofsmount_init_gzran(struct erofs_vfile **zinfo_vf,
 
 	err = ocierofs_io_open(oci_vf, oci_cfg);
 	if (err) {
+		printf("ocierofs_io_open failed: %s\n", erofs_strerror(err));
 		free(oci_vf);
 		goto cleanup;
 	}
 
 	/* If no zinfo_path, return oci_vf directly for tar format */
 	if (!zinfo_path) {
+		printf("gzran init: no zinfo provided, using tar (plain) mode\n");
 		*zinfo_vf = oci_vf;
 		return 0;
 	}
 
 	err = load_file_to_buf(zinfo_path, &zinfo_data, &zinfo_len);
 	if (err) {
+		printf("failed to load zinfo '%s': %s\n", zinfo_path, erofs_strerror(err));
 		erofs_io_close(oci_vf);
 		free(oci_vf);
 		return err;
@@ -536,6 +546,7 @@ static int erofsmount_init_gzran(struct erofs_vfile **zinfo_vf,
 	*zinfo_vf = erofs_gzran_zinfo_open(oci_vf, zinfo_data, zinfo_len);
 	if (IS_ERR(*zinfo_vf)) {
 		err = PTR_ERR(*zinfo_vf);
+		printf("erofs_gzran_zinfo_open failed: %s\n", erofs_strerror(err));
 		*zinfo_vf = NULL;
 		erofs_io_close(oci_vf);
 		free(oci_vf);
@@ -585,10 +596,16 @@ static int erofsmount_tarindex_open(struct erofs_vfile *out_vf,
 		}
 		tp->tarindex_size = st.st_size;
 	}
+	printf("tarindex_open: tarindex=%s size=%llu zinfo=%s\n",
+	       tarindex_path ? tarindex_path : "(none)",
+	       (unsigned long long)tp->tarindex_size,
+	       zinfo_path ? zinfo_path : "(none)");
 
 	err = erofsmount_init_gzran(&tp->zinfo_vf, oci_cfg, zinfo_path);
-	if (err)
+	if (err) {
+		printf("erofsmount_init_gzran failed: %s\n", erofs_strerror(err));
 		goto err_out;
+	}
 	out_vf->ops = &tarindex_vfile_ops;
 	out_vf->fd = 0;
 	out_vf->offset = 0;
@@ -680,6 +697,7 @@ static int erofsmount_startnbd(int nbdfd, struct erofs_nbd_source *source)
 
 	err = erofs_nbd_connect(nbdfd, 9, EROFSMOUNT_NBD_DISK_SIZE);
 	if (err < 0) {
+		printf("erofs_nbd_connect failed: %s\n", erofs_strerror(err));
 		erofs_io_close(&ctx.vd);
 		goto out_closefd;
 	}
@@ -1232,9 +1250,15 @@ static int erofsmount_nbd(struct erofs_nbd_source *source,
 		break;
 	}
 	if (!err) {
+		printf("mounting: dev=%s mp=%s fstype=%s flags=0x%lx options=%s\n",
+		       nbdpath, mountpoint, fstype, (unsigned long)flags,
+		       options ? options : "");
 		err = mount(nbdpath, mountpoint, fstype, flags, options);
-		if (err < 0)
-			err = -errno;
+		if (err < 0) {
+			int e = errno;
+			printf("mount() failed: errno=%d (%s)\n", e, strerror(e));
+			err = -e;
+		}
 
 		if (!err && is_netlink) {
 			id = erofs_nbd_get_identifier(num);

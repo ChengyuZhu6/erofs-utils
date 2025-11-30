@@ -62,6 +62,7 @@ struct ocierofs_ctx {
 struct ocierofs_iostream {
 	struct ocierofs_ctx *ctx;
 	u64 offset;
+	int cache_fd;
 };
 
 /*

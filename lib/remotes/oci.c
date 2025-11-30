@@ -5,6 +5,7 @@
  */
 #define _GNU_SOURCE
 #include "erofs/internal.h"
+#include "erofs/defs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,9 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifdef HAVE_SYS_SENDFILE_H
+#include <sys/sendfile.h>
+#endif
 #include <errno.h>
 #ifdef HAVE_CURL_CURL_H
 #include <curl/curl.h>
@@ -28,6 +32,10 @@
 #include "liberofs_oci.h"
 #include "liberofs_private.h"
 #include "liberofs_gzran.h"
+
+#ifndef SEEK_HOLE
+#define SEEK_HOLE 4
+#endif
 
 #ifdef OCIEROFS_ENABLED
 
@@ -1425,25 +1433,206 @@ out:
 	return ret;
 }
 
-static ssize_t ocierofs_io_pread(struct erofs_vfile *vf, void *buf, size_t len, u64 offset)
+static int ocierofs_cache(struct ocierofs_iostream *oci_iostream, off_t offset, size_t needed)
 {
-	struct ocierofs_iostream *oci_iostream = *(struct ocierofs_iostream **)vf->payload;
+	struct ocierofs_ctx *ctx = oci_iostream->ctx;
 	void *download_buf = NULL;
 	size_t download_size = 0;
-	ssize_t ret;
+	int ret = 0;
+	off_t hole, align_offset;
+	size_t download_len;
+	int layer_idx;
 
-	ret = ocierofs_download_blob_range(oci_iostream->ctx, offset, len,
+	if (oci_iostream->cache_fd < 0) {
+		char *path;
+
+		mkdir("/var/run/erofs", 0777);
+		mkdir("/var/run/erofs/cache", 0777);
+		mkdir("/var/run/erofs/cache/oci", 0777);
+
+		if (asprintf(&path, "/var/run/erofs/cache/oci/%s",
+			     ctx->blob_digest ?: "erofs_oci_unknown") < 0)
+			return -ENOMEM;
+
+		oci_iostream->cache_fd = open(path, O_RDWR | O_CREAT, 0666);
+		free(path);
+
+		if (oci_iostream->cache_fd < 0)
+			return -errno;
+
+		layer_idx = ocierofs_find_layer_by_digest(ctx, ctx->blob_digest);
+		if (layer_idx >= 0) {
+			if (ftruncate(oci_iostream->cache_fd, ctx->layers[layer_idx]->size) < 0)
+				return -errno;
+		}
+	}
+
+	hole = lseek(oci_iostream->cache_fd, offset, SEEK_HOLE);
+	if (hole < 0) {
+		if (errno == ENXIO)
+			return 0;
+		return -errno;
+	}
+	if (hole >= offset + needed)
+		return 0;
+
+	align_offset = round_down(hole, OCIEROFS_IO_CHUNK_SIZE);
+	download_len = max_t(size_t, offset + needed - align_offset, OCIEROFS_IO_CHUNK_SIZE);
+
+	ret = ocierofs_download_blob_range(ctx, align_offset, download_len,
 					   &download_buf, &download_size);
 	if (ret < 0)
 		return ret;
 
 	if (download_buf && download_size > 0) {
-		memcpy(buf, download_buf, download_size);
-		free(download_buf);
-		return download_size;
+		char *p = download_buf;
+		size_t to_write = download_size;
+		ssize_t written = 0;
+
+		while (to_write > 0) {
+			ssize_t w = pwrite(oci_iostream->cache_fd, p, to_write, align_offset + written);
+			if (w < 0) {
+				if (errno == EINTR) continue;
+				ret = -errno;
+				goto out_free;
+			}
+			written += w;
+			p += w;
+			to_write -= w;
+		}
 	}
 
-	return 0;
+out_free:
+	free(download_buf);
+	return ret;
+}
+
+static ssize_t ocierofs_io_sendfile(struct erofs_vfile *vout, struct erofs_vfile *vin,
+				    off_t *pos, size_t count)
+{
+	struct ocierofs_iostream *oci_iostream = *(struct ocierofs_iostream **)vin->payload;
+	off_t offset;
+	size_t remaining = count;
+	ssize_t total_written = 0;
+	int ret;
+
+	if (!pos)
+		offset = oci_iostream->offset;
+	else
+		offset = *pos;
+
+	ret = ocierofs_cache(oci_iostream, offset, count);
+	if (ret < 0)
+		return ret;
+
+	while (remaining > 0) {
+		struct stat st;
+
+		if (fstat(oci_iostream->cache_fd, &st) < 0)
+			return -errno;
+
+		if (offset >= st.st_size)
+			break;
+
+		size_t available = st.st_size - offset;
+		size_t chunk = min_t(size_t, remaining, available);
+
+		if (chunk == 0) {
+			chunk = min_t(size_t, remaining, OCIEROFS_IO_CHUNK_SIZE);
+		}
+
+#if defined(HAVE_SYS_SENDFILE_H) && defined(HAVE_SENDFILE)
+		off_t in_offset = offset;
+		ssize_t sent;
+
+		sent = sendfile(vout->fd, oci_iostream->cache_fd, &in_offset, chunk);
+		if (sent < 0) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			if (total_written > 0)
+				goto out;
+			return -errno;
+		}
+		if (sent == 0)
+			break;
+
+		total_written += sent;
+		remaining -= sent;
+		offset += sent;
+#else
+		chunk = min_t(size_t, remaining, available);
+		if (chunk == 0)
+			break;
+
+		char buf[32768];
+		size_t to_read = min_t(size_t, chunk, sizeof(buf));
+		ssize_t read_len, write_len;
+
+		read_len = pread(oci_iostream->cache_fd, buf, to_read, offset);
+		if (read_len < 0)
+			return -errno;
+		if (read_len == 0)
+			break;
+
+		char *p = buf;
+		size_t to_write = read_len;
+		while (to_write > 0) {
+			write_len = write(vout->fd, p, to_write);
+			if (write_len < 0) {
+				if (errno == EINTR) continue;
+				return -errno;
+			}
+			p += write_len;
+			to_write -= write_len;
+		}
+
+		total_written += read_len;
+		offset += read_len;
+		remaining -= read_len;
+#endif
+	}
+
+out:
+	if (pos)
+		*pos = offset;
+	else
+		oci_iostream->offset = offset;
+
+	return total_written;
+}
+
+static ssize_t ocierofs_io_pread(struct erofs_vfile *vf, void *buf, size_t len, u64 offset)
+{
+	struct ocierofs_iostream *oci_iostream = *(struct ocierofs_iostream **)vf->payload;
+	size_t remaining = len;
+	char *p = buf;
+	ssize_t total_read = 0;
+	int ret;
+
+	ret = ocierofs_cache(oci_iostream, offset, len);
+	if (ret < 0)
+		return ret;
+
+	while (remaining > 0) {
+		size_t chunk = min_t(size_t, remaining, OCIEROFS_IO_CHUNK_SIZE);
+		ssize_t n;
+
+		n = pread(oci_iostream->cache_fd, p, chunk, offset);
+		if (n < 0)
+			return -errno;
+		if (n == 0)
+			break;
+
+		p += n;
+		offset += n;
+		remaining -= n;
+		total_read += n;
+
+		if (n < chunk)
+			break;
+	}
+
+	return total_read;
 }
 
 static ssize_t ocierofs_io_read(struct erofs_vfile *vf, void *buf, size_t len)
@@ -1462,6 +1651,9 @@ static void ocierofs_io_close(struct erofs_vfile *vfile)
 {
 	struct ocierofs_iostream *oci_iostream = *(struct ocierofs_iostream **)vfile->payload;
 
+	if (oci_iostream->cache_fd >= 0)
+		close(oci_iostream->cache_fd);
+
 	ocierofs_ctx_cleanup(oci_iostream->ctx);
 	free(oci_iostream->ctx);
 	free(oci_iostream);
@@ -1472,6 +1664,7 @@ static struct erofs_vfops ocierofs_io_vfops = {
 	.pread = ocierofs_io_pread,
 	.read = ocierofs_io_read,
 	.close = ocierofs_io_close,
+	.sendfile = ocierofs_io_sendfile,
 };
 
 int ocierofs_io_open(struct erofs_vfile *vfile, const struct ocierofs_config *cfg)
@@ -1499,6 +1692,7 @@ int ocierofs_io_open(struct erofs_vfile *vfile, const struct ocierofs_config *cf
 
 	oci_iostream->ctx = ctx;
 	oci_iostream->offset = 0;
+	oci_iostream->cache_fd = -1;
 	*vfile = (struct erofs_vfile){.ops = &ocierofs_io_vfops};
 	*(struct ocierofs_iostream **)vfile->payload = oci_iostream;
 	return 0;

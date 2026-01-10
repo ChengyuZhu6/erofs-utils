@@ -1089,13 +1089,55 @@ static int ocierofs_parse_ref(struct ocierofs_ctx *ctx, const char *ref_str)
 	return 0;
 }
 
+static char *ocierofs_get_platform_spec(void)
+{
+#if defined(__linux__)
+	const char *os = "linux";
+#elif defined(__APPLE__)
+	const char *os = "darwin";
+#elif defined(_WIN32)
+	const char *os = "windows";
+#elif defined(__FreeBSD__)
+	const char *os = "freebsd";
+#else
+	const char *os = "linux";
+#endif
+
+#if defined(__x86_64__) || defined(__amd64__)
+	const char *arch = "amd64";
+#elif defined(__aarch64__) || defined(__arm64__)
+	const char *arch = "arm64";
+#elif defined(__i386__)
+	const char *arch = "386";
+#elif defined(__arm__)
+	const char *arch = "arm";
+#elif defined(__riscv) && (__riscv_xlen == 64)
+	const char *arch = "riscv64";
+#elif defined(__ppc64__)
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+	const char *arch = "ppc64le";
+#else
+	const char *arch = "ppc64";
+#endif
+#elif defined(__s390x__)
+	const char *arch = "s390x";
+#else
+	const char *arch = "amd64";
+#endif
+	char *platform;
+
+	if (asprintf(&platform, "%s/%s", os, arch) < 0)
+		return NULL;
+	return platform;
+}
+
 /**
  * ocierofs_init - Initialize OCI context
  * @ctx: OCI context structure to initialize
  * @config: OCI configuration
  *
  * Initialize OCI context structure, set up CURL handle, and configure
- * default parameters including platform (linux/amd64), registry
+ * default parameters including platform (host platform), registry
  * (registry-1.docker.io), and tag (latest).
  *
  * Return: 0 on success, negative errno on failure
@@ -1120,7 +1162,7 @@ static int ocierofs_init(struct ocierofs_ctx *ctx, const struct ocierofs_config 
 	if (config->platform)
 		ctx->platform = strdup(config->platform);
 	else
-		ctx->platform = strdup("linux/amd64");
+		ctx->platform = ocierofs_get_platform_spec();
 	if (!ctx->registry || !ctx->tag || !ctx->platform)
 		return -ENOMEM;
 

@@ -18,6 +18,7 @@
 #include "../lib/liberofs_nbd.h"
 #include "../lib/liberofs_oci.h"
 #include "../lib/liberofs_gzran.h"
+#include "../lib/liberofs_ublk.h"
 
 #ifdef HAVE_LINUX_LOOP_H
 #include <linux/loop.h>
@@ -46,6 +47,7 @@ enum erofs_backend_drv {
 	EROFSLOCAL,
 	EROFSFUSE,
 	EROFSNBD,
+	EROFSUBLK,
 };
 
 enum erofsmount_mode {
@@ -94,7 +96,7 @@ static void usage(int argc, char **argv)
 		" -d <0-9>              set output verbosity; 0=quiet, 9=verbose (default=%i)\n"
 		" -o options            comma-separated list of mount options\n"
 		" -t type[.subtype]     filesystem type (and optional subtype)\n"
-		"                       subtypes: fuse, local, nbd\n"
+		"                       subtypes: fuse, local, nbd, ublk\n"
 		" -u                    unmount the filesystem\n"
 		"    --disconnect       abort an existing NBD device forcibly\n"
 		"    --reattach         reattach to an existing NBD device\n"
@@ -318,6 +320,8 @@ static int erofsmount_parse_options(int argc, char **argv)
 					mountcfg.backend = EROFSLOCAL;
 				} else if (!strcmp(dot + 1, "nbd")) {
 					mountcfg.backend = EROFSNBD;
+				} else if (!strcmp(dot + 1, "ublk")) {
+					mountcfg.backend = EROFSUBLK;
 				} else {
 					erofs_err("invalid filesystem subtype `%s`", dot + 1);
 					return -EINVAL;
@@ -1331,6 +1335,145 @@ out_err:
 	return -errno;
 }
 
+static int erofsmount_ublk_handler(void *ctx, struct erofs_ublk_request *req)
+{
+	struct erofs_vfile *vf = ctx;
+	ssize_t ret;
+
+	if (req->op != EROFS_UBLK_OP_READ)
+		return -EOPNOTSUPP;
+
+	ret = erofs_io_pread(vf, req->buf, req->nr_sectors << 9,
+			     req->start_sector << 9);
+	if (ret < 0)
+		return (int)ret;
+
+	req->result = ret;
+	return 0;
+}
+
+static int erofsmount_ublk(struct erofs_nbd_source *source,
+			   const char *mountpoint, const char *fstype,
+			   int flags, const char *options)
+{
+	int pipefd[2];
+	char dev_path[64];
+	pid_t pid;
+	int err;
+
+	if (!erofs_ublk_is_supported()) {
+		fprintf(stderr, "ublk not supported (liburing missing or kernel module not loaded)\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (pipe(pipefd) < 0)
+		return -errno;
+
+	pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -errno;
+	}
+
+	if (pid == 0) {
+		struct erofs_vfile vf = {};
+		struct erofs_ublk_dev *dev = NULL;
+		struct erofs_ublk_dev_info info = {};
+		struct stat st;
+		int dev_id;
+
+		fprintf(stderr, "DEBUG: In child process (pid=%d)\n", getpid());
+		close(pipefd[0]);
+
+		if (source->type == EROFSNBD_SOURCE_OCI) {
+			if (source->ocicfg.tarindex_path || source->ocicfg.zinfo_path) {
+				err = erofsmount_tarindex_open(&vf, &source->ocicfg,
+							       source->ocicfg.tarindex_path,
+							       source->ocicfg.zinfo_path);
+			} else {
+				err = ocierofs_io_open(&vf, &source->ocicfg);
+			}
+		} else {
+			fprintf(stderr, "DEBUG: Opening local device %s\n", source->device_path);
+			err = open(source->device_path, O_RDONLY);
+			if (err >= 0) {
+				vf.fd = err;
+				err = 0; // Reset err to success
+			} else {
+				fprintf(stderr, "DEBUG: Failed to open %s: %s\n", 
+					source->device_path, strerror(errno));
+				err = -errno;
+			}
+		}
+
+		if (err) {
+			fprintf(stderr, "DEBUG: Source open failed with %d\n", err);
+			exit(EXIT_FAILURE);
+		}
+
+		if (erofs_ublk_init() < 0) {
+			fprintf(stderr, "erofs_ublk_init failed\n");
+			exit(EXIT_FAILURE);
+		}
+
+		info.nr_hw_queues = 1;
+		info.queue_depth = 64; // Reduced from 128
+		info.max_io_buf_bytes = 65536; // Reduced from 512KB to 64KB
+		info.dev_id = -1;
+		info.blkbits = 12;
+
+		if (source->type == EROFSNBD_SOURCE_LOCAL &&
+		    fstat(vf.fd, &st) == 0)
+			info.dev_size = st.st_size;
+		else
+			info.dev_size = INT64_MAX;
+
+		fprintf(stderr, "Calling erofs_ublk_create_dev with fd=%d\n", vf.fd);
+		err = erofs_ublk_create_dev(&info, erofsmount_ublk_handler, &vf, &dev);
+		if (err) {
+			fprintf(stderr, "erofs_ublk_create_dev failed: %s\n", strerror(-err));
+			exit(EXIT_FAILURE);
+		}
+
+		dev_id = erofs_ublk_get_dev_id(dev);
+		if (write(pipefd[1], &dev_id, sizeof(dev_id)) != sizeof(dev_id))
+			exit(EXIT_FAILURE);
+		close(pipefd[1]);
+
+		erofs_ublk_set_sig_handler(dev);
+		erofs_ublk_start(dev);
+		erofs_ublk_destroy(dev);
+		if (vf.fd > 0)
+			close(vf.fd);
+		exit(EXIT_SUCCESS);
+	}
+
+	close(pipefd[1]);
+	int dev_id;
+	if (read(pipefd[0], &dev_id, sizeof(dev_id)) != sizeof(dev_id)) {
+		waitpid(pid, NULL, 0);
+		close(pipefd[0]);
+		return -EIO;
+	}
+	close(pipefd[0]);
+
+	snprintf(dev_path, sizeof(dev_path), "/dev/ublkb%d", dev_id);
+
+	int retries = 50;
+	while (access(dev_path, F_OK) != 0 && retries-- > 0)
+		usleep(20000);
+
+	err = mount(dev_path, mountpoint, fstype, flags, options);
+	if (err < 0) {
+		err = -errno;
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, 0);
+		return err;
+	}
+	return 0;
+}
+
 int erofsmount_umount(char *target)
 {
 	char *device = NULL, *mountpoint = NULL;
@@ -1474,6 +1617,7 @@ int main(int argc, char *argv[])
 {
 	int err;
 
+	fprintf(stderr, "DEBUG: Starting mount.erofs (ublk supported)\n");
 	erofs_init_configure();
 	err = erofsmount_parse_options(argc, argv);
 	if (err) {
@@ -1519,6 +1663,16 @@ int main(int argc, char *argv[])
 			nbdsrc.device_path = mountcfg.device;
 		err = erofsmount_nbd(&nbdsrc, mountcfg.target,
 				     mountcfg.fstype, mountcfg.flags, mountcfg.options);
+		goto exit;
+	}
+
+	if (mountcfg.backend == EROFSUBLK) {
+		if (nbdsrc.type == EROFSNBD_SOURCE_OCI)
+			nbdsrc.ocicfg.image_ref = mountcfg.device;
+		else
+			nbdsrc.device_path = mountcfg.device;
+		err = erofsmount_ublk(&nbdsrc, mountcfg.target,
+				      mountcfg.fstype, mountcfg.flags, mountcfg.options);
 		goto exit;
 	}
 

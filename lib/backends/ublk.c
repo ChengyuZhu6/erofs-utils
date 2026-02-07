@@ -386,17 +386,24 @@ static void ublk_set_io_flusher(void)
 
 /*
  * Send control command via io_uring
+ * Uses IORING_SETUP_SQE128 for 128-byte SQE (required by ublk)
  */
 #ifdef HAVE_LIBURING
 static int ublk_ctrl_cmd(int ctrl_fd, __u32 cmd_op,
 			 const struct ublksrv_ctrl_cmd *cmd_data)
 {
 	struct io_uring ring;
+	struct io_uring_params p;
 	struct io_uring_sqe *sqe;
 	struct io_uring_cqe *cqe;
+	struct ublksrv_ctrl_cmd *cmd;
 	int ret;
 
-	ret = io_uring_queue_init(2, &ring, 0);
+	/* Initialize ring with SQE128 flag for ublk commands */
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SQE128;
+
+	ret = io_uring_queue_init_params(4, &ring, &p);
 	if (ret < 0) {
 		erofs_err("io_uring_queue_init failed: %s", strerror(-ret));
 		return ret;
@@ -408,10 +415,18 @@ static int ublk_ctrl_cmd(int ctrl_fd, __u32 cmd_op,
 		goto out;
 	}
 
+	/* Prepare uring command - use io_uring_prep_rw for basic setup */
 	io_uring_prep_rw(IORING_OP_URING_CMD, sqe, ctrl_fd, NULL, 0, 0);
 	sqe->cmd_op = cmd_op;
-	if (cmd_data)
-		memcpy(sqe->cmd, cmd_data, sizeof(*cmd_data));
+
+	/*
+	 * For SQE128, the command data area starts at offset 48 (sqe->addr3).
+	 * With liburing, sqe->cmd points to offset 48 in the 128-byte SQE.
+	 */
+	if (cmd_data) {
+		cmd = (struct ublksrv_ctrl_cmd *)sqe->cmd;
+		memcpy(cmd, cmd_data, sizeof(*cmd_data));
+	}
 
 	ret = io_uring_submit(&ring);
 	if (ret < 0) {
@@ -689,18 +704,18 @@ static int ublk_queue_io_cmd(struct erofs_ublk_queue *q, int tag)
 	else
 		cmd_op = UBLK_U_IO_COMMIT_AND_FETCH_REQ;
 
-	/* Use fixed file if registered for better performance */
-	if (q->use_fixed_file) {
-		io_uring_prep_rw(IORING_OP_URING_CMD, sqe, 0, NULL, 0, 0);
-		sqe->flags |= IOSQE_FIXED_FILE;
-	} else {
-		io_uring_prep_rw(IORING_OP_URING_CMD, sqe, q->dev->cdev_fd,
-				 NULL, 0, 0);
-	}
+	/*
+	 * Setup SQE manually for URING_CMD in SQE128 mode.
+	 * Don't use io_uring_prep_rw as it clears addr3/cmd area.
+	 */
+	memset(sqe, 0, sizeof(*sqe) * 2);  /* Clear both 64-byte halves in SQE128 mode */
 
+	sqe->opcode = IORING_OP_URING_CMD;
+	sqe->fd = q->dev->cdev_fd;
 	sqe->cmd_op = cmd_op;
 	sqe->user_data = tag;
 
+	/* Command data starts at offset 48 (sqe->cmd / sqe->addr3) */
 	cmd = (struct ublksrv_io_cmd *)sqe->cmd;
 	cmd->q_id = q->q_id;
 	cmd->tag = tag;
@@ -710,8 +725,12 @@ static int ublk_queue_io_cmd(struct erofs_ublk_queue *q, int tag)
 	else
 		cmd->result = 0;
 
-	/* In USER_COPY mode, addr is used for buffer address */
-	cmd->addr = (__u64)(uintptr_t)ublk_get_io_buf(q, tag);
+	/*
+	 * In USER_COPY mode:
+	 * - FETCH_REQ: addr must be 0 (kernel doesn't use buffer address)
+	 * - COMMIT_AND_FETCH_REQ/NEED_GET_DATA: addr is unused (we use pread/pwrite)
+	 */
+	cmd->addr = 0;
 
 	/* Clear flags for next round */
 	io->flags = 0;
@@ -1029,7 +1048,6 @@ static int ublk_init_queue(struct erofs_ublk_dev *dev, int q_id)
 	struct erofs_ublk_queue *q = &dev->queues[q_id];
 	struct io_uring_params p;
 	unsigned int cmd_buf_size;
-	unsigned int ring_flags;
 	int ret;
 
 	q->q_id = q_id;
@@ -1089,60 +1107,35 @@ static int ublk_init_queue(struct erofs_ublk_dev *dev, int q_id)
 	}
 
 	/*
-	 * Initialize io_uring with optimal flags:
-	 * - IORING_SETUP_COOP_TASKRUN: Avoid IPI for task work
-	 * - IORING_SETUP_SINGLE_ISSUER: Single thread submitting (optimization)
-	 * - IORING_SETUP_DEFER_TASKRUN: Defer task work to io_uring_get_events()
-	 * - IORING_SETUP_CQSIZE: Larger CQ for burst handling
+	 * Initialize io_uring with SQE128 (required for ublk uring commands)
+	 * Start with minimal flags for debugging.
 	 */
 	memset(&p, 0, sizeof(p));
-	ring_flags = IORING_SETUP_COOP_TASKRUN |
-		     IORING_SETUP_SINGLE_ISSUER;
-
-	/* Try with DEFER_TASKRUN first (requires 6.1+ kernel) */
-	p.flags = ring_flags | IORING_SETUP_DEFER_TASKRUN;
-	p.cq_entries = q->q_depth * 2;  /* Larger CQ for better burst handling */
+	p.flags = IORING_SETUP_SQE128;
 
 	ret = io_uring_queue_init_params(q->q_depth * 2, &q->ring, &p);
-	if (ret >= 0) {
-		q->use_defer_taskrun = 1;
-		erofs_dbg("queue %d using DEFER_TASKRUN mode", q_id);
-	} else {
-		/* Fallback without DEFER_TASKRUN */
-		memset(&p, 0, sizeof(p));
-		p.flags = ring_flags;
-		p.cq_entries = q->q_depth * 2;
-
-		ret = io_uring_queue_init_params(q->q_depth * 2, &q->ring, &p);
-		if (ret < 0) {
-			/* Fallback to minimal flags for older kernels */
-			ret = io_uring_queue_init(q->q_depth * 2, &q->ring,
-						  IORING_SETUP_COOP_TASKRUN);
-			if (ret < 0) {
-				/* Final fallback: no flags */
-				ret = io_uring_queue_init(q->q_depth * 2,
-							  &q->ring, 0);
-				if (ret < 0) {
-					erofs_err("io_uring_queue_init failed: %s",
-						  strerror(-ret));
-					goto err_unmap_buf;
-				}
-			}
-		}
+	if (ret < 0) {
+		erofs_err("io_uring_queue_init failed: %s", strerror(-ret));
+		goto err_unmap_buf;
 	}
+	q->use_defer_taskrun = 0;
 
 	/* Register the cdev fd for faster access (use fixed file) */
-	ret = io_uring_register_files(&q->ring, &dev->cdev_fd, 1);
+	/* Disabled for now - seems to cause issues with SQE128 */
+	ret = -1; // io_uring_register_files(&q->ring, &dev->cdev_fd, 1);
 	if (ret >= 0) {
 		q->use_fixed_file = 1;
 		erofs_dbg("queue %d using fixed file", q_id);
 	} else {
-		erofs_dbg("io_uring_register_files failed: %s (continuing without)",
+		q->use_fixed_file = 0;
+		erofs_dbg("io_uring_register_files disabled/failed: %s (continuing without)",
 			  strerror(-ret));
 	}
 
-	/* Register ring fd for better performance */
-	io_uring_register_ring_fd(&q->ring);
+	/* 
+	 * NOTE: Don't call io_uring_register_ring_fd() here.
+	 * It causes issues with io_uring_submit() using wrong fd.
+	 */
 
 	return 0;
 

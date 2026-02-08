@@ -99,7 +99,7 @@ static void usage(int argc, char **argv)
 		"                       subtypes: fuse, local, nbd, ublk\n"
 		" -u                    unmount the filesystem\n"
 		"    --disconnect       abort an existing NBD device forcibly\n"
-		"    --reattach         reattach to an existing NBD device\n"
+		"    --reattach         reattach to an existing NBD or ublk device\n"
 #ifdef OCIEROFS_ENABLED
 		"\n"
 		"OCI-specific options (EXPERIMENTAL, with -o):\n"
@@ -721,6 +721,8 @@ out_closefd:
 static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *source)
 {
 	char *b64cred = NULL;
+	char *default_platform = NULL;
+	const char *platform;
 	int ret;
 
 	if (source->ocicfg.username || source->ocicfg.password) {
@@ -730,40 +732,51 @@ static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *sourc
 			return PTR_ERR(b64cred);
 	}
 
+	/* Get platform: use configured value or detect from host */
+	platform = source->ocicfg.platform;
+	if (!platform || !*platform) {
+		default_platform = ocierofs_get_platform_spec();
+		platform = default_platform;
+	}
+
 	if ((source->ocicfg.tarindex_path || source->ocicfg.zinfo_path) &&
 	    source->ocicfg.blob_digest && *source->ocicfg.blob_digest) {
 		ret = fprintf(f, "TARINDEX_OCI_BLOB %s %s %s %s %s %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.blob_digest,
 			      b64cred ?: "",
 			      source->ocicfg.tarindex_path ?: "",
 			      source->ocicfg.zinfo_path ?: "");
 		free(b64cred);
+		free(default_platform);
 		return ret < 0 ? -ENOMEM : 0;
 	}
 
 	if (source->ocicfg.blob_digest && *source->ocicfg.blob_digest) {
 		ret = fprintf(f, "OCI_NATIVE_BLOB %s %s %s %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.blob_digest,
 			      b64cred ?: "");
 		free(b64cred);
+		free(default_platform);
 		return ret < 0 ? -ENOMEM : 0;
 	}
 
 	if (source->ocicfg.layer_index >= 0) {
 		ret = fprintf(f, "OCI_LAYER %s %s %d %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.layer_index,
 			      b64cred ?: "");
 		free(b64cred);
+		free(default_platform);
 		return ret < 0 ? -ENOMEM : 0;
 	}
 
 	free(b64cred);
+	free(default_platform);
 	return -EINVAL;
 }
 #else
@@ -870,6 +883,7 @@ static int erofsmount_parse_recovery_ociblob(struct ocierofs_config *oci_cfg,
 	char *tokens[4] = {0};
 	int token_count = 0;
 	char *p = source;
+	const char *digest;
 	int err;
 
 	while (token_count < 4 && (p = strchr(p, ' ')) != NULL) {
@@ -886,9 +900,9 @@ static int erofsmount_parse_recovery_ociblob(struct ocierofs_config *oci_cfg,
 
 	oci_cfg->image_ref = source;
 	oci_cfg->platform = tokens[0];
+	digest = tokens[1];
 
 	{
-		const char *digest = tokens[1];
 		const char *hex;
 
 		if (!digest || strncmp(digest, "sha256:", 7) != 0)
@@ -1092,6 +1106,104 @@ out_fork:
 	return num;
 }
 
+static int erofsmount_ublk_handler(void *ctx, struct erofs_ublk_request *req);
+
+static int erofsmount_reattach_ublk(int dev_id)
+{
+	char recp[64], *line = NULL, *source;
+	struct erofs_vfile vf = {};
+	size_t n = 0;
+	FILE *f;
+	int err, recoverable;
+
+	recoverable = erofs_ublk_is_recoverable(dev_id);
+	if (!recoverable) {
+		erofs_err("ublk device %d is not recoverable (not quiesced or recovery not enabled)", dev_id);
+		return -ENODEV;
+	}
+
+	snprintf(recp, sizeof(recp),
+		 "/var/run/erofs/mountublk_ublkb%d", dev_id);
+	f = fopen(recp, "r");
+	if (!f) {
+		erofs_err("cannot open recovery file %s: %s",
+			  recp, strerror(errno));
+		return -errno;
+	}
+
+	if ((err = getline(&line, &n, f)) <= 0) {
+		err = -errno;
+		fclose(f);
+		goto err_line;
+	}
+	fclose(f);
+	if (err && line[err - 1] == '\n')
+		line[err - 1] = '\0';
+
+	source = strchr(line, ' ');
+	if (!source) {
+		erofs_err("invalid source in ublk recovery file: %s", line);
+		err = -EINVAL;
+		goto err_line;
+	}
+	*(source++) = '\0';
+
+	if (!strcmp(line, "LOCAL")) {
+		err = open(source, O_RDONLY);
+		if (err < 0) {
+			err = -errno;
+			goto err_line;
+		}
+		vf.fd = err;
+	} else if (!strcmp(line, "OCI_LAYER") || !strcmp(line, "OCI_NATIVE_BLOB")) {
+		err = erofsmount_reattach_oci(&vf, line, source);
+		if (err)
+			goto err_line;
+	} else if (!strcmp(line, "TARINDEX_OCI_BLOB")) {
+		/* For tarindex OCI, we need an nbd ctx wrapper */
+		struct erofsmount_nbd_ctx tmpctx = {};
+		err = erofsmount_reattach_gzran_oci(&tmpctx, source);
+		if (err)
+			goto err_line;
+		vf = tmpctx.vd;
+	} else {
+		erofs_err("unsupported source type %s in ublk recovery file", line);
+		err = -EOPNOTSUPP;
+		goto err_line;
+	}
+
+	if (fork() == 0) {
+		struct erofs_ublk_dev *dev = NULL;
+
+		free(line);
+		if (erofs_ublk_init() < 0)
+			exit(EXIT_FAILURE);
+
+		err = erofs_ublk_recover_dev(dev_id,
+					     erofsmount_ublk_handler,
+					     &vf, &dev);
+		if (err) {
+			erofs_err("erofs_ublk_recover_dev failed: %s",
+				  strerror(-err));
+			exit(EXIT_FAILURE);
+		}
+
+		erofs_ublk_set_sig_handler(dev);
+		erofs_ublk_complete_recovery(dev);
+
+		/* Clean up recovery file on normal exit */
+		unlink(recp);
+		erofs_ublk_destroy(dev);
+		erofs_io_close(&vf);
+		exit(EXIT_SUCCESS);
+	}
+	erofs_io_close(&vf);
+	err = 0;
+err_line:
+	free(line);
+	return err;
+}
+
 static int erofsmount_reattach(const char *target)
 {
 	char *identifier, *line, *source, *recp = NULL;
@@ -1105,7 +1217,18 @@ static int erofsmount_reattach(const char *target)
 	if (err < 0)
 		return -errno;
 
-	if (!S_ISBLK(st.st_mode) || major(st.st_rdev) != EROFS_NBD_MAJOR)
+	if (!S_ISBLK(st.st_mode))
+		return -ENOTBLK;
+
+	/* Check if this is a ublk device (/dev/ublkbN) */
+	{
+		int ublk_dev_id;
+		int ret = sscanf(target, "/dev/ublkb%d", &ublk_dev_id);
+		if (ret == 1)
+			return erofsmount_reattach_ublk(ublk_dev_id);
+	}
+
+	if (major(st.st_rdev) != EROFS_NBD_MAJOR)
 		return -ENOTBLK;
 
 	nbdnum = erofs_nbd_get_index_from_minor(minor(st.st_rdev));
@@ -1383,7 +1506,6 @@ static int erofsmount_ublk(struct erofs_nbd_source *source,
 		struct stat st;
 		int dev_id;
 
-		fprintf(stderr, "DEBUG: In child process (pid=%d)\n", getpid());
 		close(pipefd[0]);
 
 		if (source->type == EROFSNBD_SOURCE_OCI) {
@@ -1395,20 +1517,16 @@ static int erofsmount_ublk(struct erofs_nbd_source *source,
 				err = ocierofs_io_open(&vf, &source->ocicfg);
 			}
 		} else {
-			fprintf(stderr, "DEBUG: Opening local device %s\n", source->device_path);
 			err = open(source->device_path, O_RDONLY);
 			if (err >= 0) {
 				vf.fd = err;
-				err = 0; // Reset err to success
+				err = 0;
 			} else {
-				fprintf(stderr, "DEBUG: Failed to open %s: %s\n", 
-					source->device_path, strerror(errno));
 				err = -errno;
 			}
 		}
 
 		if (err) {
-			fprintf(stderr, "DEBUG: Source open failed with %d\n", err);
 			exit(EXIT_FAILURE);
 		}
 
@@ -1422,6 +1540,7 @@ static int erofsmount_ublk(struct erofs_nbd_source *source,
 		info.max_io_buf_bytes = 65536; // Reduced from 512KB to 64KB
 		info.dev_id = -1;
 		info.blkbits = 12;
+		info.flags = EROFS_UBLK_F_USER_RECOVERY;  /* Enable crash recovery */
 
 		if (source->type == EROFSNBD_SOURCE_LOCAL &&
 		    fstat(vf.fd, &st) == 0)
@@ -1437,12 +1556,34 @@ static int erofsmount_ublk(struct erofs_nbd_source *source,
 		}
 
 		dev_id = erofs_ublk_get_dev_id(dev);
+
+		/* Write recovery info file for --reattach support */
+		{
+			char *recp, ublk_recp[64];
+			recp = erofsmount_write_recovery_info(source);
+			if (!IS_ERR(recp)) {
+				snprintf(ublk_recp, sizeof(ublk_recp),
+					 "/var/run/erofs/mountublk_ublkb%d",
+					 dev_id);
+				rename(recp, ublk_recp);
+				free(recp);
+			}
+		}
+
 		if (write(pipefd[1], &dev_id, sizeof(dev_id)) != sizeof(dev_id))
 			exit(EXIT_FAILURE);
 		close(pipefd[1]);
 
 		erofs_ublk_set_sig_handler(dev);
 		erofs_ublk_start(dev);
+
+		/* Clean up recovery file before destroy */
+		{
+			char ublk_recp[64];
+			snprintf(ublk_recp, sizeof(ublk_recp),
+				 "/var/run/erofs/mountublk_ublkb%d", dev_id);
+			unlink(ublk_recp);
+		}
 		erofs_ublk_destroy(dev);
 		if (vf.fd > 0)
 			close(vf.fd);
@@ -1617,7 +1758,6 @@ int main(int argc, char *argv[])
 {
 	int err;
 
-	fprintf(stderr, "DEBUG: Starting mount.erofs (ublk supported)\n");
 	erofs_init_configure();
 	err = erofsmount_parse_options(argc, argv);
 	if (err) {

@@ -74,6 +74,8 @@
 	_IOWR('u', UBLK_CMD_START_USER_RECOVERY, struct ublksrv_ctrl_cmd)
 #define UBLK_U_CMD_END_USER_RECOVERY	\
 	_IOWR('u', UBLK_CMD_END_USER_RECOVERY, struct ublksrv_ctrl_cmd)
+#define UBLK_U_CMD_DEL_DEV_ASYNC	\
+	_IOR('u', 0x14, struct ublksrv_ctrl_cmd)
 
 #define UBLK_U_IO_FETCH_REQ		\
 	_IOWR('u', UBLK_IO_FETCH_REQ, struct ublksrv_io_cmd)
@@ -1040,6 +1042,7 @@ static void *ublk_queue_thread(void *arg)
 	}
 
 	erofs_info("queue %d thread exiting", q->q_id);
+	q->dev->stop_requested = 1;
 	return NULL;
 }
 
@@ -1853,5 +1856,31 @@ void *erofs_ublk_aio_get_buf(struct erofs_ublk_aio_ctx *ctx)
 		return NULL;
 
 	return ublk_get_io_buf(q, ctx->tag);
+#endif
+}
+
+int erofs_ublk_del_dev_by_id(int dev_id)
+{
+#ifndef HAVE_LIBURING
+	(void)dev_id;
+	return -EOPNOTSUPP;
+#else
+	struct ublksrv_ctrl_cmd cmd = {0};
+	int ctrl_fd, ret;
+
+	ctrl_fd = open(UBLK_CTRL_DEV, O_RDWR);
+	if (ctrl_fd < 0)
+		return -errno;
+
+	cmd.dev_id = dev_id;
+	cmd.queue_id = (__u16)-1;
+
+	ret = ublk_ctrl_cmd(ctrl_fd, UBLK_U_CMD_STOP_DEV, &cmd);
+	if (ret < 0 && ret != -ENODEV)
+		erofs_dbg("STOP_DEV %d: %s", dev_id, strerror(-ret));
+
+	ret = ublk_ctrl_cmd(ctrl_fd, UBLK_U_CMD_DEL_DEV_ASYNC, &cmd);
+	close(ctrl_fd);
+	return ret;
 #endif
 }

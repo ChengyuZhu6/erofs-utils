@@ -97,6 +97,7 @@
 #define UBLK_S_DEV_DEAD		0
 #define UBLK_S_DEV_LIVE		1
 #define UBLK_S_DEV_QUIESCED	2
+#define UBLK_S_DEV_FAIL_IO	3
 
 /* IO result codes */
 #define UBLK_IO_RES_OK			0
@@ -669,6 +670,8 @@ static int ublk_get_params(struct erofs_ublk_dev *dev)
 {
 	struct ublksrv_ctrl_cmd cmd = {0};
 	int ret;
+
+	dev->params.len = sizeof(dev->params);
 
 	cmd.dev_id = dev->dev_info.dev_id;
 	cmd.queue_id = (__u16)-1;
@@ -1575,12 +1578,18 @@ int erofs_ublk_recover_dev(int dev_id,
 	}
 
 	/* Check if device is quiesced (ready for recovery) */
-	if (dev->dev_info.state != UBLK_S_DEV_QUIESCED) {
-		erofs_err("Device %d is not in quiesced state (state=%d)",
+	if (dev->dev_info.state != UBLK_S_DEV_QUIESCED &&
+	    dev->dev_info.state != UBLK_S_DEV_FAIL_IO) {
+		erofs_err("Device %d is not in recoverable state (state=%d)",
 			  dev_id, dev->dev_info.state);
 		ret = -EBUSY;
 		goto err_close_ctrl;
 	}
+
+	/* Get device parameters before starting recovery */
+	ret = ublk_get_params(dev);
+	if (ret < 0)
+		goto err_close_ctrl;
 
 	/* Start recovery process */
 	ret = ublk_start_recovery(dev);
@@ -1595,11 +1604,6 @@ int erofs_ublk_recover_dev(int dev_id,
 		erofs_err("Failed to open %s: %s", cdev_path, strerror(errno));
 		goto err_close_ctrl;
 	}
-
-	/* Get device parameters */
-	ret = ublk_get_params(dev);
-	if (ret < 0)
-		goto err_close_cdev;
 
 	/* Allocate queues */
 	dev->queues = calloc(dev->dev_info.nr_hw_queues,

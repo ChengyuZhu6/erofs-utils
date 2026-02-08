@@ -1120,7 +1120,7 @@ static int ocierofs_parse_ref(struct ocierofs_ctx *ctx, const char *ref_str)
 	return 0;
 }
 
-static char *ocierofs_get_platform_spec(void)
+char *ocierofs_get_platform_spec(void)
 {
 	const char *os = NULL, *arch = NULL, *variant = NULL;
 	char *platform;

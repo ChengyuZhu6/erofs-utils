@@ -362,6 +362,17 @@ int erofs_ublk_get_dev_path(struct erofs_ublk_dev *dev, char *buf, size_t buflen
  */
 const char *erofs_ublk_op_name(int op);
 
+/**
+ * erofs_ublk_del_dev_by_id - Delete a ublk device by its device ID
+ * @dev_id: Device ID (the N in /dev/ublkbN)
+ *
+ * Sends UBLK_U_CMD_DEL_DEV to the kernel to remove the ublk device.
+ * This will also terminate the associated ublk backend process.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int erofs_ublk_del_dev_by_id(int dev_id);
+
 #ifdef __cplusplus
 }
 #endif

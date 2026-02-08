@@ -1615,6 +1615,15 @@ static int erofsmount_ublk(struct erofs_nbd_source *source,
 	return 0;
 }
 
+static int ublk_dev_id_from_path(const char *path)
+{
+	int dev_id;
+
+	if (sscanf(path, "/dev/ublkb%d", &dev_id) == 1)
+		return dev_id;
+	return -1;
+}
+
 int erofsmount_umount(char *target)
 {
 	char *device = NULL, *mountpoint = NULL;
@@ -1652,7 +1661,7 @@ int erofsmount_umount(char *target)
 
 	for (s = NULL; (getline(&s, &n, mounts)) > 0;) {
 		bool hit = false;
-		char *f1, *f2, *end;
+		char *f1, *f2 = NULL, *end;
 
 		f1 = s;
 		end = strchr(f1, ' ');
@@ -1669,31 +1678,51 @@ int erofsmount_umount(char *target)
 				hit = true;
 		}
 		if (hit) {
-			if (isblk) {
-				err = -EBUSY;
-				free(s);
-				fclose(mounts);
-				goto err_out;
-			}
 			free(device);
 			device = strdup(f1);
-			if (!mountpoint)
-				mountpoint = strdup(f2);
+			free(mountpoint);
+			mountpoint = f2 ? strdup(f2) : NULL;
 		}
 	}
 	free(s);
 	fclose(mounts);
+
+	if (isblk && !device) {
+		/* Block device not mounted -- try to clean up directly */
+		if (S_ISBLK(st.st_mode) && major(st.st_rdev) == EROFS_NBD_MAJOR) {
+			nbdnum = erofs_nbd_get_index_from_minor(minor(st.st_rdev));
+			err = erofs_nbd_nl_disconnect(nbdnum);
+			if (err != -EOPNOTSUPP)
+				goto err_out;
+		}
+		if (ublk_dev_id_from_path(target) >= 0) {
+			err = erofs_ublk_del_dev_by_id(ublk_dev_id_from_path(target));
+			goto err_out;
+		}
+		err = -ENOENT;
+		goto err_out;
+	}
+
 	if (!isblk && !device) {
 		err = -ENOENT;
 		goto err_out;
 	}
 
-	if (isblk && !mountpoint &&
-	    S_ISBLK(st.st_mode) && major(st.st_rdev) == EROFS_NBD_MAJOR) {
-		nbdnum = erofs_nbd_get_index_from_minor(minor(st.st_rdev));
-		err = erofs_nbd_nl_disconnect(nbdnum);
-		if (err != -EOPNOTSUPP)
-			return err;
+	if (ublk_dev_id_from_path(device) >= 0) {
+		/*
+		 * For ublk: umount first, then delete the device.
+		 * Do NOT open the block device — it may block if the
+		 * backend process is already gone.
+		 */
+		if (mountpoint) {
+			err = umount(mountpoint);
+			if (err) {
+				err = -errno;
+				goto err_out;
+			}
+		}
+		err = erofs_ublk_del_dev_by_id(ublk_dev_id_from_path(device));
+		goto err_out;
 	}
 
 	/* Avoid TOCTOU issue with NBD_CFLAG_DISCONNECT_ON_CLOSE */
@@ -1711,15 +1740,16 @@ int erofsmount_umount(char *target)
 		}
 	}
 	err = fstat(fd, &st);
-	if (err < 0)
+	if (err < 0) {
 		err = -errno;
-	else if (S_ISBLK(st.st_mode) && major(st.st_rdev) == EROFS_NBD_MAJOR) {
+	} else if (S_ISBLK(st.st_mode) && major(st.st_rdev) == EROFS_NBD_MAJOR) {
 		nbdnum = erofs_nbd_get_index_from_minor(minor(st.st_rdev));
 		err = erofs_nbd_nl_disconnect(nbdnum);
 		if (err == -EOPNOTSUPP)
 			err = erofs_nbd_disconnect(fd);
 	}
 	close(fd);
+
 err_out:
 	free(device);
 	free(mountpoint);

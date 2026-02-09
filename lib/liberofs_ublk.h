@@ -174,10 +174,23 @@ int erofs_ublk_create_dev(const struct erofs_ublk_dev_info *info,
  * from another thread or signal handler.
  *
  * Once started, the block device /dev/ublkbN becomes accessible.
+ * If a ready_fd was set via erofs_ublk_set_ready_fd(), the device ID
+ * will be written to it after the device is started.
  *
  * Return: 0 on normal exit, negative errno on failure.
  */
 int erofs_ublk_start(struct erofs_ublk_dev *dev);
+
+/**
+ * erofs_ublk_set_ready_fd - Set fd to notify when device is ready
+ * @dev: Device handle
+ * @fd: File descriptor to write a ready byte to after ublk_start_dev()
+ *
+ * When set, erofs_ublk_start() will write a single byte (0) to this fd
+ * after the device is successfully started and /dev/ublkbN is available,
+ * then close it. This allows the parent process to avoid polling.
+ */
+void erofs_ublk_set_ready_fd(struct erofs_ublk_dev *dev, int fd);
 
 /**
  * erofs_ublk_stop - Stop the ublk device

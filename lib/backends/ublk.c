@@ -280,6 +280,7 @@ struct erofs_ublk_queue {
 	int efd;				/* eventfd for wakeup/shutdown */
 	int use_fixed_file;			/* using registered file */
 	int use_defer_taskrun;			/* using DEFER_TASKRUN mode */
+	pthread_barrier_t *init_barrier;	/* barrier for thread init sync */
 #ifdef HAVE_LIBURING
 	struct io_uring ring;
 #endif
@@ -297,6 +298,12 @@ struct erofs_ublk_dev {
 	volatile int running;
 	volatile int stop_requested;
 	int async_enabled;			/* Async IO support enabled */
+	int stop_efd;				/* eventfd for stop signal */
+	int ready_fd;				/* fd to signal device readiness */
+#ifdef HAVE_LIBURING
+	struct io_uring ctrl_ring;		/* reusable control ring */
+	int ctrl_ring_initialized;
+#endif
 };
 
 /* Control device path */
@@ -388,35 +395,35 @@ static void ublk_set_io_flusher(void)
 }
 
 /*
- * Send control command via io_uring
- * Uses IORING_SETUP_SQE128 for 128-byte SQE (required by ublk)
+ * Initialize a reusable control io_uring ring
  */
 #ifdef HAVE_LIBURING
-static int ublk_ctrl_cmd(int ctrl_fd, __u32 cmd_op,
-			 const struct ublksrv_ctrl_cmd *cmd_data)
+static int ublk_ctrl_ring_init(struct io_uring *ring)
 {
-	struct io_uring ring;
 	struct io_uring_params p;
+
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SQE128;
+
+	return io_uring_queue_init_params(4, ring, &p);
+}
+
+/*
+ * Send control command via io_uring using a provided ring.
+ * If ring is NULL, creates a temporary one (for standalone use).
+ */
+static int ublk_ctrl_cmd_ring(struct io_uring *ring, int ctrl_fd,
+			      __u32 cmd_op,
+			      const struct ublksrv_ctrl_cmd *cmd_data)
+{
 	struct io_uring_sqe *sqe;
 	struct io_uring_cqe *cqe;
 	struct ublksrv_ctrl_cmd *cmd;
 	int ret;
 
-	/* Initialize ring with SQE128 flag for ublk commands */
-	memset(&p, 0, sizeof(p));
-	p.flags = IORING_SETUP_SQE128;
-
-	ret = io_uring_queue_init_params(4, &ring, &p);
-	if (ret < 0) {
-		erofs_err("io_uring_queue_init failed: %s", strerror(-ret));
-		return ret;
-	}
-
-	sqe = io_uring_get_sqe(&ring);
-	if (!sqe) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	sqe = io_uring_get_sqe(ring);
+	if (!sqe)
+		return -ENOMEM;
 
 	/* Prepare uring command - use io_uring_prep_rw for basic setup */
 	io_uring_prep_rw(IORING_OP_URING_CMD, sqe, ctrl_fd, NULL, 0, 0);
@@ -431,24 +438,52 @@ static int ublk_ctrl_cmd(int ctrl_fd, __u32 cmd_op,
 		memcpy(cmd, cmd_data, sizeof(*cmd_data));
 	}
 
-	ret = io_uring_submit(&ring);
+	ret = io_uring_submit(ring);
 	if (ret < 0) {
 		erofs_err("io_uring_submit failed: %s", strerror(-ret));
-		goto out;
+		return ret;
 	}
 
-	ret = io_uring_wait_cqe(&ring, &cqe);
+	ret = io_uring_wait_cqe(ring, &cqe);
 	if (ret < 0) {
 		erofs_err("io_uring_wait_cqe failed: %s", strerror(-ret));
-		goto out;
+		return ret;
 	}
 
 	ret = cqe->res;
-	io_uring_cqe_seen(&ring, cqe);
+	io_uring_cqe_seen(ring, cqe);
+	return ret;
+}
 
-out:
+/*
+ * Send control command via io_uring
+ * Creates a temporary ring for standalone callers (e.g., del_dev_by_id)
+ */
+static int ublk_ctrl_cmd(int ctrl_fd, __u32 cmd_op,
+			 const struct ublksrv_ctrl_cmd *cmd_data)
+{
+	struct io_uring ring;
+	int ret;
+
+	ret = ublk_ctrl_ring_init(&ring);
+	if (ret < 0) {
+		erofs_err("io_uring_queue_init failed: %s", strerror(-ret));
+		return ret;
+	}
+
+	ret = ublk_ctrl_cmd_ring(&ring, ctrl_fd, cmd_op, cmd_data);
 	io_uring_queue_exit(&ring);
 	return ret;
+}
+
+/*
+ * Send control command using device's persistent control ring
+ */
+static int ublk_dev_ctrl_cmd(struct erofs_ublk_dev *dev, __u32 cmd_op,
+			     const struct ublksrv_ctrl_cmd *cmd_data)
+{
+	return ublk_ctrl_cmd_ring(&dev->ctrl_ring, dev->ctrl_fd,
+				  cmd_op, cmd_data);
 }
 
 /*
@@ -465,7 +500,7 @@ static int ublk_get_queue_affinity(struct erofs_ublk_dev *dev, int q_id,
 	cmd.len = sizeof(cpu_set_t);
 	cmd.addr = (__u64)(uintptr_t)cpuset;
 
-	ret = ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_GET_QUEUE_AFFINITY, &cmd);
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_GET_QUEUE_AFFINITY, &cmd);
 	if (ret < 0)
 		erofs_dbg("GET_QUEUE_AFFINITY failed for q%d: %s",
 			  q_id, strerror(-ret));
@@ -505,7 +540,7 @@ static int ublk_add_dev(struct erofs_ublk_dev *dev,
 	cmd.len = sizeof(*dev_info);
 	cmd.addr = (__u64)(uintptr_t)dev_info;
 
-	ret = ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_ADD_DEV, &cmd);
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_ADD_DEV, &cmd);
 	if (ret < 0) {
 		erofs_err("UBLK_CMD_ADD_DEV failed: %s", strerror(-ret));
 		return ret;
@@ -527,7 +562,7 @@ static int ublk_del_dev(struct erofs_ublk_dev *dev)
 	cmd.dev_id = dev->dev_info.dev_id;
 	cmd.queue_id = (__u16)-1;
 
-	return ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_DEL_DEV, &cmd);
+	return ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_DEL_DEV, &cmd);
 }
 
 /*
@@ -558,7 +593,7 @@ static int ublk_set_params(struct erofs_ublk_dev *dev,
 	cmd.len = sizeof(*params);
 	cmd.addr = (__u64)(uintptr_t)params;
 
-	ret = ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_SET_PARAMS, &cmd);
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_SET_PARAMS, &cmd);
 	if (ret < 0)
 		erofs_err("UBLK_CMD_SET_PARAMS failed: %s", strerror(-ret));
 
@@ -577,7 +612,7 @@ static int ublk_start_dev(struct erofs_ublk_dev *dev)
 	cmd.queue_id = (__u16)-1;
 	cmd.data[0] = getpid();
 
-	ret = ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_START_DEV, &cmd);
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_START_DEV, &cmd);
 	if (ret < 0)
 		erofs_err("UBLK_CMD_START_DEV failed: %s", strerror(-ret));
 	else
@@ -597,7 +632,7 @@ static int ublk_stop_dev(struct erofs_ublk_dev *dev)
 	cmd.dev_id = dev->dev_info.dev_id;
 	cmd.queue_id = (__u16)-1;
 
-	return ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_STOP_DEV, &cmd);
+	return ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_STOP_DEV, &cmd);
 }
 
 /*
@@ -612,7 +647,7 @@ static int ublk_start_recovery(struct erofs_ublk_dev *dev)
 	cmd.dev_id = dev->dev_info.dev_id;
 	cmd.queue_id = (__u16)-1;
 
-	ret = ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_START_USER_RECOVERY, &cmd);
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_START_USER_RECOVERY, &cmd);
 	if (ret < 0)
 		erofs_err("START_USER_RECOVERY failed: %s", strerror(-ret));
 	else
@@ -635,7 +670,7 @@ static int ublk_end_recovery(struct erofs_ublk_dev *dev)
 	cmd.queue_id = (__u16)-1;
 	cmd.data[0] = getpid();
 
-	ret = ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_END_USER_RECOVERY, &cmd);
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_END_USER_RECOVERY, &cmd);
 	if (ret < 0)
 		erofs_err("END_USER_RECOVERY failed: %s", strerror(-ret));
 	else
@@ -680,7 +715,7 @@ static int ublk_get_params(struct erofs_ublk_dev *dev)
 	cmd.len = sizeof(dev->params);
 	cmd.addr = (__u64)(uintptr_t)&dev->params;
 
-	ret = ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_GET_PARAMS, &cmd);
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_GET_PARAMS, &cmd);
 	if (ret < 0)
 		erofs_err("GET_PARAMS failed: %s", strerror(-ret));
 
@@ -988,8 +1023,14 @@ static void *ublk_queue_thread(void *arg)
 	ret = ublk_submit_fetch_commands(q);
 	if (ret < 0) {
 		erofs_err("Failed to submit fetch commands: %s", strerror(-ret));
+		if (q->init_barrier)
+			pthread_barrier_wait(q->init_barrier);
 		return NULL;
 	}
+
+	/* Signal that this thread has initialized and submitted fetch commands */
+	if (q->init_barrier)
+		pthread_barrier_wait(q->init_barrier);
 
 	erofs_info("queue %d thread started (tid=%d, fixed_file=%d, defer_taskrun=%d)",
 		   q->q_id, gettid(), q->use_fixed_file, q->use_defer_taskrun);
@@ -1279,6 +1320,8 @@ int erofs_ublk_create_dev(const struct erofs_ublk_dev_info *info,
 	dev->handler_ctx = handler_ctx;
 	dev->ctrl_fd = -1;
 	dev->cdev_fd = -1;
+	dev->stop_efd = -1;
+	dev->ready_fd = -1;
 	dev->async_enabled = 0;  /* Will be set based on device flags after get_dev_info */
 
 	/* Open control device */
@@ -1288,6 +1331,19 @@ int erofs_ublk_create_dev(const struct erofs_ublk_dev_info *info,
 		erofs_err("Failed to open %s: %s", UBLK_CTRL_DEV, strerror(errno));
 		goto err_free;
 	}
+
+	/* Initialize persistent control ring to avoid per-command ring creation */
+	ret = ublk_ctrl_ring_init(&dev->ctrl_ring);
+	if (ret < 0) {
+		erofs_err("ctrl ring init failed: %s", strerror(-ret));
+		goto err_close_ctrl;
+	}
+	dev->ctrl_ring_initialized = 1;
+
+	/* Create stop eventfd for blocking wait instead of polling */
+	dev->stop_efd = eventfd(0, EFD_CLOEXEC);
+	if (dev->stop_efd < 0)
+		erofs_dbg("stop eventfd creation failed: %s", strerror(errno));
 
 	/* Add device */
 	ret = ublk_add_dev(dev, info);
@@ -1349,6 +1405,7 @@ int erofs_ublk_start(struct erofs_ublk_dev *dev)
 	(void)dev;
 	return -EOPNOTSUPP;
 #else
+	pthread_barrier_t init_barrier;
 	int i, ret;
 
 	if (!dev)
@@ -1357,8 +1414,17 @@ int erofs_ublk_start(struct erofs_ublk_dev *dev)
 	/* Apply OOM protection before starting IO threads */
 	ublk_apply_oom_protection();
 
+	/* Initialize barrier: nr_hw_queues threads + 1 main thread */
+	ret = pthread_barrier_init(&init_barrier,
+				   NULL, dev->dev_info.nr_hw_queues + 1);
+	if (ret) {
+		erofs_err("pthread_barrier_init failed: %s", strerror(ret));
+		return -ret;
+	}
+
 	/* Start queue threads */
 	for (i = 0; i < dev->dev_info.nr_hw_queues; i++) {
+		dev->queues[i].init_barrier = &init_barrier;
 		ret = pthread_create(&dev->queues[i].thread, NULL,
 				     ublk_queue_thread, &dev->queues[i]);
 		if (ret) {
@@ -1367,8 +1433,11 @@ int erofs_ublk_start(struct erofs_ublk_dev *dev)
 		}
 	}
 
-	/* Small delay to let threads initialize */
-	usleep(10000);
+	/* Wait for all queue threads to finish initialization */
+	pthread_barrier_wait(&init_barrier);
+	pthread_barrier_destroy(&init_barrier);
+	for (i = 0; i < dev->dev_info.nr_hw_queues; i++)
+		dev->queues[i].init_barrier = NULL;
 
 	/* Start the device */
 	ret = ublk_start_dev(dev);
@@ -1376,16 +1445,40 @@ int erofs_ublk_start(struct erofs_ublk_dev *dev)
 		goto err_stop_threads;
 
 	dev->running = 1;
+
+	/* Signal readiness to parent process via ready_fd */
+	if (dev->ready_fd >= 0) {
+		char ready = 0;
+		if (write(dev->ready_fd, &ready, 1) != 1)
+			erofs_dbg("ready_fd write failed");
+		close(dev->ready_fd);
+		dev->ready_fd = -1;
+	}
 	erofs_info("ublk device started successfully");
 
-	/* Wait for stop signal */
-	while (!dev->stop_requested)
-		usleep(100000);
+	/* Wait for stop signal via eventfd (blocking, no polling) */
+	if (dev->stop_efd >= 0) {
+		uint64_t val;
+		while (!dev->stop_requested) {
+			if (read(dev->stop_efd, &val, sizeof(val)) < 0) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			break;
+		}
+	} else {
+		/* Fallback: polling if eventfd not available */
+		while (!dev->stop_requested)
+			usleep(100000);
+	}
 
 	return 0;
 
 err_stop_threads:
+	pthread_barrier_destroy(&init_barrier);
 	for (i = 0; i < dev->dev_info.nr_hw_queues; i++) {
+		dev->queues[i].init_barrier = NULL;
 		if (dev->queues[i].thread) {
 			dev->queues[i].state |= UBLKSRV_QUEUE_STOPPING;
 			pthread_join(dev->queues[i].thread, NULL);
@@ -1409,6 +1502,13 @@ int erofs_ublk_stop(struct erofs_ublk_dev *dev)
 
 	dev->stop_requested = 1;
 
+	/* Wake up the main thread waiting on stop_efd */
+	if (dev->stop_efd >= 0) {
+		uint64_t val = 1;
+		if (write(dev->stop_efd, &val, sizeof(val)) != sizeof(val))
+			erofs_dbg("stop_efd write failed");
+	}
+
 	/* Stop all queues */
 	for (i = 0; i < dev->dev_info.nr_hw_queues; i++)
 		dev->queues[i].state |= UBLKSRV_QUEUE_STOPPING;
@@ -1420,6 +1520,12 @@ int erofs_ublk_stop(struct erofs_ublk_dev *dev)
 	dev->running = 0;
 	return 0;
 #endif
+}
+
+void erofs_ublk_set_ready_fd(struct erofs_ublk_dev *dev, int fd)
+{
+	if (dev)
+		dev->ready_fd = fd;
 }
 
 void erofs_ublk_destroy(struct erofs_ublk_dev *dev)
@@ -1448,6 +1554,14 @@ void erofs_ublk_destroy(struct erofs_ublk_dev *dev)
 		ublk_del_dev(dev);
 		close(dev->ctrl_fd);
 	}
+
+	/* Cleanup persistent control ring */
+	if (dev->ctrl_ring_initialized)
+		io_uring_queue_exit(&dev->ctrl_ring);
+
+	/* Cleanup stop eventfd */
+	if (dev->stop_efd >= 0)
+		close(dev->stop_efd);
 
 	free(dev);
 #endif
@@ -1558,6 +1672,8 @@ int erofs_ublk_recover_dev(int dev_id,
 	dev->handler_ctx = handler_ctx;
 	dev->ctrl_fd = -1;
 	dev->cdev_fd = -1;
+	dev->stop_efd = -1;
+	dev->ready_fd = -1;
 	dev->async_enabled = 0;  /* Will be set based on device flags after get_dev_info */
 
 	/* Open control device */
@@ -1567,6 +1683,19 @@ int erofs_ublk_recover_dev(int dev_id,
 		erofs_err("Failed to open %s: %s", UBLK_CTRL_DEV, strerror(errno));
 		goto err_free;
 	}
+
+	/* Initialize persistent control ring to avoid per-command ring creation */
+	ret = ublk_ctrl_ring_init(&dev->ctrl_ring);
+	if (ret < 0) {
+		erofs_err("ctrl ring init failed: %s", strerror(-ret));
+		goto err_close_ctrl;
+	}
+	dev->ctrl_ring_initialized = 1;
+
+	/* Create stop eventfd for blocking wait instead of polling */
+	dev->stop_efd = eventfd(0, EFD_CLOEXEC);
+	if (dev->stop_efd < 0)
+		erofs_dbg("stop eventfd creation failed: %s", strerror(errno));
 
 	/* Get existing device info */
 	ret = ublk_get_dev_info(dev, dev_id);
@@ -1646,6 +1775,7 @@ int erofs_ublk_complete_recovery(struct erofs_ublk_dev *dev)
 	(void)dev;
 	return -EOPNOTSUPP;
 #else
+	pthread_barrier_t init_barrier;
 	int i, ret;
 
 	if (!dev)
@@ -1655,8 +1785,17 @@ int erofs_ublk_complete_recovery(struct erofs_ublk_dev *dev)
 	if (!(dev->dev_info.flags & UBLK_F_UNPRIVILEGED_DEV))
 		ublk_apply_oom_protection();
 
+	/* Initialize barrier: nr_hw_queues threads + 1 main thread */
+	ret = pthread_barrier_init(&init_barrier,
+				   NULL, dev->dev_info.nr_hw_queues + 1);
+	if (ret) {
+		erofs_err("pthread_barrier_init failed: %s", strerror(ret));
+		return -ret;
+	}
+
 	/* Start queue threads */
 	for (i = 0; i < dev->dev_info.nr_hw_queues; i++) {
+		dev->queues[i].init_barrier = &init_barrier;
 		ret = pthread_create(&dev->queues[i].thread, NULL,
 				     ublk_queue_thread, &dev->queues[i]);
 		if (ret) {
@@ -1665,8 +1804,11 @@ int erofs_ublk_complete_recovery(struct erofs_ublk_dev *dev)
 		}
 	}
 
-	/* Small delay to let threads initialize */
-	usleep(10000);
+	/* Wait for all queue threads to finish initialization */
+	pthread_barrier_wait(&init_barrier);
+	pthread_barrier_destroy(&init_barrier);
+	for (i = 0; i < dev->dev_info.nr_hw_queues; i++)
+		dev->queues[i].init_barrier = NULL;
 
 	/* Complete recovery */
 	ret = ublk_end_recovery(dev);
@@ -1676,14 +1818,28 @@ int erofs_ublk_complete_recovery(struct erofs_ublk_dev *dev)
 	dev->running = 1;
 	erofs_info("ublk device recovery completed successfully");
 
-	/* Wait for stop signal */
-	while (!dev->stop_requested)
-		usleep(100000);
+	/* Wait for stop signal via eventfd (blocking, no polling) */
+	if (dev->stop_efd >= 0) {
+		uint64_t val;
+		while (!dev->stop_requested) {
+			if (read(dev->stop_efd, &val, sizeof(val)) < 0) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			break;
+		}
+	} else {
+		while (!dev->stop_requested)
+			usleep(100000);
+	}
 
 	return 0;
 
 err_stop_threads:
+	pthread_barrier_destroy(&init_barrier);
 	for (i = 0; i < dev->dev_info.nr_hw_queues; i++) {
+		dev->queues[i].init_barrier = NULL;
 		if (dev->queues[i].thread) {
 			dev->queues[i].state |= UBLKSRV_QUEUE_STOPPING;
 			pthread_join(dev->queues[i].thread, NULL);

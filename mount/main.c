@@ -1572,9 +1572,15 @@ static int erofsmount_ublk(struct erofs_nbd_source *source,
 
 		if (write(pipefd[1], &dev_id, sizeof(dev_id)) != sizeof(dev_id))
 			exit(EXIT_FAILURE);
-		close(pipefd[1]);
 
 		erofs_ublk_set_sig_handler(dev);
+
+		/*
+		 * Set the pipe as ready_fd so erofs_ublk_start() will write
+		 * a ready byte after ublk_start_dev() succeeds, then close it.
+		 * The parent detects device readiness by reading this byte.
+		 */
+		erofs_ublk_set_ready_fd(dev, pipefd[1]);
 		erofs_ublk_start(dev);
 
 		/* Clean up recovery file before destroy */
@@ -1597,13 +1603,24 @@ static int erofsmount_ublk(struct erofs_nbd_source *source,
 		close(pipefd[0]);
 		return -EIO;
 	}
-	close(pipefd[0]);
 
 	snprintf(dev_path, sizeof(dev_path), "/dev/ublkb%d", dev_id);
 
-	int retries = 50;
-	while (access(dev_path, F_OK) != 0 && retries-- > 0)
-		usleep(20000);
+	/*
+	 * Wait for the child to signal that ublk_start_dev() has completed
+	 * and /dev/ublkbN is available. The child writes a ready byte via
+	 * ready_fd (which is this same pipe).
+	 */
+	{
+		char ready;
+		if (read(pipefd[0], &ready, 1) != 1) {
+			/* Child failed to start device */
+			waitpid(pid, NULL, 0);
+			close(pipefd[0]);
+			return -EIO;
+		}
+	}
+	close(pipefd[0]);
 
 	err = mount(dev_path, mountpoint, fstype, flags, options);
 	if (err < 0) {

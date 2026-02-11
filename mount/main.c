@@ -100,7 +100,7 @@ static void usage(int argc, char **argv)
 		"    --reattach         reattach to an existing NBD device\n"
 #ifdef OCIEROFS_ENABLED
 		"\n"
-		"OCI-specific options (with -o):\n"
+		"OCI-specific options (EXPERIMENTAL, with -o):\n"
 		"   oci.blob=<digest>   specify OCI blob digest (sha256:...)\n"
 		"   oci.layer=<index>   specify OCI layer index\n"
 		"   oci.platform=<name> specify platform (default: linux/amd64)\n"
@@ -228,6 +228,7 @@ static long erofsmount_parse_flagopts(char *s, long flags, char **more)
 		if (strncmp(s, "oci", 3) == 0) {
 			/* Initialize ocicfg here iff != EROFSNBD_SOURCE_OCI */
 			if (nbdsrc.type != EROFSNBD_SOURCE_OCI) {
+				erofs_warn("OCI support is EXPERIMENTAL, use at your own risk.");
 				nbdsrc.type = EROFSNBD_SOURCE_OCI;
 				nbdsrc.ocicfg.layer_index = -1;
 			}

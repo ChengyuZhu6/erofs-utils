@@ -18,6 +18,7 @@
 #include "../lib/liberofs_nbd.h"
 #include "../lib/liberofs_oci.h"
 #include "../lib/liberofs_gzran.h"
+#include "../lib/liberofs_ublk.h"
 
 #ifdef HAVE_LINUX_LOOP_H
 #include <linux/loop.h>
@@ -46,6 +47,7 @@ enum erofs_backend_drv {
 	EROFSLOCAL,
 	EROFSFUSE,
 	EROFSNBD,
+	EROFSUBLK,
 };
 
 enum erofsmount_mode {
@@ -94,7 +96,7 @@ static void usage(int argc, char **argv)
 		" -d <0-9>              set output verbosity; 0=quiet, 9=verbose (default=%i)\n"
 		" -o options            comma-separated list of mount options\n"
 		" -t type[.subtype]     filesystem type (and optional subtype)\n"
-		"                       subtypes: fuse, local, nbd\n"
+		"                       subtypes: fuse, local, nbd, ublk\n"
 		" -u                    unmount the filesystem\n"
 		"    --disconnect       abort an existing NBD device forcibly\n"
 		"    --reattach         reattach to an existing NBD device\n"
@@ -318,6 +320,8 @@ static int erofsmount_parse_options(int argc, char **argv)
 					mountcfg.backend = EROFSLOCAL;
 				} else if (!strcmp(dot + 1, "nbd")) {
 					mountcfg.backend = EROFSNBD;
+				} else if (!strcmp(dot + 1, "ublk")) {
+					mountcfg.backend = EROFSUBLK;
 				} else {
 					erofs_err("invalid filesystem subtype `%s`", dot + 1);
 					return -EINVAL;
@@ -1345,6 +1349,165 @@ out_err:
 	return -errno;
 }
 
+static int erofsmount_ublk_handler(void *ctx, struct erofs_ublk_request *req)
+{
+	struct erofs_vfile *vf = ctx;
+	ssize_t ret;
+
+	if (req->op != EROFS_UBLK_OP_READ)
+		return -EOPNOTSUPP;
+
+	ret = erofs_io_pread(vf, req->buf, req->nr_sectors << 9,
+			     req->start_sector << 9);
+	if (ret < 0)
+		return (int)ret;
+
+	req->result = ret;
+	return 0;
+}
+
+static int erofsmount_ublk(struct erofs_nbd_source *source,
+			   const char *mountpoint, const char *fstype,
+			   int flags, const char *options)
+{
+	int pipefd[2];
+	char dev_path[64];
+	pid_t pid;
+	int err;
+
+	if (!erofs_ublk_is_supported()) {
+		erofs_err("ublk not supported (liburing missing or kernel module not loaded)");
+		return -EOPNOTSUPP;
+	}
+
+	if (pipe(pipefd) < 0)
+		return -errno;
+
+	pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -errno;
+	}
+
+	if (pid == 0) {
+		struct erofs_vfile vf = {};
+		struct erofs_ublk_dev *dev = NULL;
+		struct erofs_ublk_dev_info info = {};
+		struct stat st;
+		int dev_id;
+
+		close(pipefd[0]);
+
+		if (source->type == EROFSNBD_SOURCE_OCI) {
+			if (source->ocicfg.tarindex_path ||
+			    source->ocicfg.zinfo_path) {
+				err = erofsmount_tarindex_open(
+					&vf, &source->ocicfg,
+					source->ocicfg.tarindex_path,
+					source->ocicfg.zinfo_path);
+			} else {
+				err = ocierofs_io_open(&vf, &source->ocicfg);
+			}
+		} else {
+			err = open(source->device_path, O_RDONLY);
+			if (err >= 0) {
+				vf.fd = err;
+				err = 0;
+			} else {
+				err = -errno;
+			}
+		}
+
+		if (err)
+			exit(EXIT_FAILURE);
+
+		if (erofs_ublk_init() < 0) {
+			erofs_err("erofs_ublk_init failed");
+			exit(EXIT_FAILURE);
+		}
+
+		info.nr_hw_queues = 1;
+		info.queue_depth = 64;
+		info.max_io_buf_bytes = 65536;
+		info.dev_id = -1;
+		info.blkbits = 12;
+
+		if (source->type == EROFSNBD_SOURCE_LOCAL &&
+		    fstat(vf.fd, &st) == 0)
+			info.dev_size = st.st_size;
+		else
+			info.dev_size = INT64_MAX;
+
+		err = erofs_ublk_create_dev(&info,
+					    erofsmount_ublk_handler, &vf, &dev);
+		if (err) {
+			erofs_err("erofs_ublk_create_dev failed: %s",
+				  strerror(-err));
+			exit(EXIT_FAILURE);
+		}
+
+		dev_id = erofs_ublk_get_dev_id(dev);
+
+		if (write(pipefd[1], &dev_id, sizeof(dev_id)) != sizeof(dev_id))
+			exit(EXIT_FAILURE);
+
+		erofs_ublk_set_sig_handler(dev);
+
+		/*
+		 * Use ready_fd so erofs_ublk_start() signals the parent
+		 * after ublk_start_dev() succeeds.
+		 */
+		erofs_ublk_set_ready_fd(dev, pipefd[1]);
+		erofs_ublk_start(dev);
+
+		erofs_ublk_destroy(dev);
+		if (vf.fd > 0)
+			close(vf.fd);
+		exit(EXIT_SUCCESS);
+	}
+
+	/* Parent: wait for child to send device ID */
+	close(pipefd[1]);
+	{
+		int dev_id;
+		char ready;
+
+		if (read(pipefd[0], &dev_id, sizeof(dev_id)) != sizeof(dev_id)) {
+			waitpid(pid, NULL, 0);
+			close(pipefd[0]);
+			return -EIO;
+		}
+		snprintf(dev_path, sizeof(dev_path), "/dev/ublkb%d", dev_id);
+
+		/* Wait for the child to signal device readiness */
+		if (read(pipefd[0], &ready, 1) != 1) {
+			waitpid(pid, NULL, 0);
+			close(pipefd[0]);
+			return -EIO;
+		}
+	}
+	close(pipefd[0]);
+
+	err = mount(dev_path, mountpoint, fstype, flags, options);
+	if (err < 0) {
+		err = -errno;
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, 0);
+		return err;
+	}
+	return 0;
+}
+
+static int ublk_dev_id_from_path(const char *path)
+{
+	int dev_id;
+
+	if (sscanf(path, "/dev/ublkb%d", &dev_id) == 1)
+		return dev_id;
+	return -1;
+}
+
 int erofsmount_umount(char *target)
 {
 	char *device = NULL, *mountpoint = NULL;
@@ -1382,7 +1545,7 @@ int erofsmount_umount(char *target)
 
 	for (s = NULL; (getline(&s, &n, mounts)) > 0;) {
 		bool hit = false;
-		char *f1, *f2, *end;
+		char *f1, *f2 = NULL, *end;
 
 		f1 = s;
 		end = strchr(f1, ' ');
@@ -1399,31 +1562,51 @@ int erofsmount_umount(char *target)
 				hit = true;
 		}
 		if (hit) {
-			if (isblk) {
-				err = -EBUSY;
-				free(s);
-				fclose(mounts);
-				goto err_out;
-			}
 			free(device);
 			device = strdup(f1);
-			if (!mountpoint)
-				mountpoint = strdup(f2);
+			free(mountpoint);
+			mountpoint = f2 ? strdup(f2) : NULL;
 		}
 	}
 	free(s);
 	fclose(mounts);
+
+	if (isblk && !device) {
+		if (S_ISBLK(st.st_mode) && major(st.st_rdev) == EROFS_NBD_MAJOR) {
+			nbdnum = erofs_nbd_get_index_from_minor(minor(st.st_rdev));
+			err = erofs_nbd_nl_disconnect(nbdnum);
+			if (err != -EOPNOTSUPP)
+				goto err_out;
+		}
+		if (ublk_dev_id_from_path(target) >= 0) {
+			err = erofs_ublk_del_dev_by_id(
+				ublk_dev_id_from_path(target));
+			goto err_out;
+		}
+		err = -ENOENT;
+		goto err_out;
+	}
+
 	if (!isblk && !device) {
 		err = -ENOENT;
 		goto err_out;
 	}
 
-	if (isblk && !mountpoint &&
-	    S_ISBLK(st.st_mode) && major(st.st_rdev) == EROFS_NBD_MAJOR) {
-		nbdnum = erofs_nbd_get_index_from_minor(minor(st.st_rdev));
-		err = erofs_nbd_nl_disconnect(nbdnum);
-		if (err != -EOPNOTSUPP)
-			return err;
+	if (ublk_dev_id_from_path(device) >= 0) {
+		/*
+		 * For ublk: umount first, then delete the device.
+		 * Do NOT open the block device -- it may block if the
+		 * backend process is already gone.
+		 */
+		if (mountpoint) {
+			err = umount(mountpoint);
+			if (err) {
+				err = -errno;
+				goto err_out;
+			}
+		}
+		err = erofs_ublk_del_dev_by_id(ublk_dev_id_from_path(device));
+		goto err_out;
 	}
 
 	/* Avoid TOCTOU issue with NBD_CFLAG_DISCONNECT_ON_CLOSE */
@@ -1441,15 +1624,16 @@ int erofsmount_umount(char *target)
 		}
 	}
 	err = fstat(fd, &st);
-	if (err < 0)
+	if (err < 0) {
 		err = -errno;
-	else if (S_ISBLK(st.st_mode) && major(st.st_rdev) == EROFS_NBD_MAJOR) {
+	} else if (S_ISBLK(st.st_mode) && major(st.st_rdev) == EROFS_NBD_MAJOR) {
 		nbdnum = erofs_nbd_get_index_from_minor(minor(st.st_rdev));
 		err = erofs_nbd_nl_disconnect(nbdnum);
 		if (err == -EOPNOTSUPP)
 			err = erofs_nbd_disconnect(fd);
 	}
 	close(fd);
+
 err_out:
 	free(device);
 	free(mountpoint);
@@ -1533,6 +1717,17 @@ int main(int argc, char *argv[])
 			nbdsrc.device_path = mountcfg.device;
 		err = erofsmount_nbd(&nbdsrc, mountcfg.target,
 				     mountcfg.fstype, mountcfg.flags, mountcfg.options);
+		goto exit;
+	}
+
+	if (mountcfg.backend == EROFSUBLK) {
+		if (nbdsrc.type == EROFSNBD_SOURCE_OCI)
+			nbdsrc.ocicfg.image_ref = mountcfg.device;
+		else
+			nbdsrc.device_path = mountcfg.device;
+		err = erofsmount_ublk(&nbdsrc, mountcfg.target,
+				      mountcfg.fstype, mountcfg.flags,
+				      mountcfg.options);
 		goto exit;
 	}
 

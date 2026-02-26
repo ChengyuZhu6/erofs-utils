@@ -717,6 +717,8 @@ out_closefd:
 static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *source)
 {
 	char *b64cred = NULL;
+	char *default_platform = NULL;
+	const char *platform;
 	int ret;
 
 	if (source->ocicfg.username || source->ocicfg.password) {
@@ -726,40 +728,51 @@ static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *sourc
 			return PTR_ERR(b64cred);
 	}
 
+	/* Get platform: use configured value or detect from host */
+	platform = source->ocicfg.platform;
+	if (!platform || !*platform) {
+		default_platform = ocierofs_get_platform_spec();
+		platform = default_platform;
+	}
+
 	if ((source->ocicfg.tarindex_path || source->ocicfg.zinfo_path) &&
 	    source->ocicfg.blob_digest && *source->ocicfg.blob_digest) {
 		ret = fprintf(f, "TARINDEX_OCI_BLOB %s %s %s %s %s %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.blob_digest,
 			      b64cred ?: "",
 			      source->ocicfg.tarindex_path ?: "",
 			      source->ocicfg.zinfo_path ?: "");
 		free(b64cred);
+		free(default_platform);
 		return ret < 0 ? -ENOMEM : 0;
 	}
 
 	if (source->ocicfg.blob_digest && *source->ocicfg.blob_digest) {
 		ret = fprintf(f, "OCI_NATIVE_BLOB %s %s %s %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.blob_digest,
 			      b64cred ?: "");
 		free(b64cred);
+		free(default_platform);
 		return ret < 0 ? -ENOMEM : 0;
 	}
 
 	if (source->ocicfg.layer_index >= 0) {
 		ret = fprintf(f, "OCI_LAYER %s %s %d %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.layer_index,
 			      b64cred ?: "");
 		free(b64cred);
+		free(default_platform);
 		return ret < 0 ? -ENOMEM : 0;
 	}
 
 	free(b64cred);
+	free(default_platform);
 	return -EINVAL;
 }
 #else
@@ -866,6 +879,7 @@ static int erofsmount_parse_recovery_ociblob(struct ocierofs_config *oci_cfg,
 	char *tokens[4] = {0};
 	int token_count = 0;
 	char *p = source;
+	const char *digest;
 	int err;
 
 	while (token_count < 4 && (p = strchr(p, ' ')) != NULL) {
@@ -882,9 +896,9 @@ static int erofsmount_parse_recovery_ociblob(struct ocierofs_config *oci_cfg,
 
 	oci_cfg->image_ref = source;
 	oci_cfg->platform = tokens[0];
+	digest = tokens[1];
 
 	{
-		const char *digest = tokens[1];
 		const char *hex;
 
 		if (!digest || strncmp(digest, "sha256:", 7) != 0)

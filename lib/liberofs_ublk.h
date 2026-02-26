@@ -217,6 +217,53 @@ int erofs_ublk_stop(struct erofs_ublk_dev *dev);
  */
 int erofs_ublk_set_sig_handler(struct erofs_ublk_dev *dev);
 
+/**
+ * erofs_ublk_recover_dev - Recover an existing ublk device after crash
+ * @dev_id:      Device ID to recover
+ * @handler:     IO request handler callback
+ * @handler_ctx: Context passed to handler
+ * @pdev:        Output device handle
+ *
+ * Reattaches to an existing ublk device that was created with
+ * EROFS_UBLK_F_USER_RECOVERY flag and is in quiesced state.
+ *
+ * This function:
+ *   1. Gets the existing device info and params
+ *   2. Initiates recovery with START_USER_RECOVERY
+ *   3. Re-initializes queues
+ *
+ * After this, call erofs_ublk_complete_recovery() to finish.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int erofs_ublk_recover_dev(int dev_id,
+			   erofs_ublk_io_handler_t handler,
+			   void *handler_ctx,
+			   struct erofs_ublk_dev **pdev);
+
+/**
+ * erofs_ublk_complete_recovery - Complete the recovery process
+ * @dev: Device handle from erofs_ublk_recover_dev()
+ *
+ * Starts queue threads and completes recovery with END_USER_RECOVERY.
+ * This function blocks until erofs_ublk_stop() is called.
+ *
+ * Return: 0 on normal exit, negative errno on failure.
+ */
+int erofs_ublk_complete_recovery(struct erofs_ublk_dev *dev);
+
+/**
+ * erofs_ublk_is_recoverable - Check if a device can be recovered
+ * @dev_id: Device ID to check
+ *
+ * Checks if the specified device:
+ *   - Exists
+ *   - Was created with USER_RECOVERY flag
+ *   - Is in quiesced state (previous handler crashed)
+ *
+ * Return: 1 if recoverable, 0 otherwise.
+ */
+int erofs_ublk_is_recoverable(int dev_id);
 
 /*
  * Asynchronous IO Support

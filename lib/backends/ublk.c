@@ -99,6 +99,7 @@
 #define UBLK_S_DEV_DEAD		0
 #define UBLK_S_DEV_LIVE		1
 #define UBLK_S_DEV_QUIESCED	2
+#define UBLK_S_DEV_FAIL_IO	3
 
 /* IO result codes */
 #define UBLK_IO_RES_OK			0
@@ -632,6 +633,93 @@ static int ublk_stop_dev(struct erofs_ublk_dev *dev)
 	cmd.queue_id = (__u16)-1;
 
 	return ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_STOP_DEV, &cmd);
+}
+
+/*
+ * Start user recovery process
+ * This should be called after device crash to reattach to existing device
+ */
+static int ublk_start_recovery(struct erofs_ublk_dev *dev)
+{
+	struct ublksrv_ctrl_cmd cmd = {0};
+	int ret;
+
+	cmd.dev_id = dev->dev_info.dev_id;
+	cmd.queue_id = (__u16)-1;
+
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_START_USER_RECOVERY, &cmd);
+	if (ret < 0)
+		erofs_err("START_USER_RECOVERY failed: %s", strerror(-ret));
+	else
+		erofs_info("ublk device %d recovery started",
+			   dev->dev_info.dev_id);
+
+	return ret;
+}
+
+/*
+ * End user recovery process
+ * This should be called after handler and queues are re-initialized
+ */
+static int ublk_end_recovery(struct erofs_ublk_dev *dev)
+{
+	struct ublksrv_ctrl_cmd cmd = {0};
+	int ret;
+
+	cmd.dev_id = dev->dev_info.dev_id;
+	cmd.queue_id = (__u16)-1;
+	cmd.data[0] = getpid();
+
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_END_USER_RECOVERY, &cmd);
+	if (ret < 0)
+		erofs_err("END_USER_RECOVERY failed: %s", strerror(-ret));
+	else
+		erofs_info("ublk device %d recovery completed",
+			   dev->dev_info.dev_id);
+
+	return ret;
+}
+
+/*
+ * Get device info (for recovery - reattach to existing device)
+ */
+static int ublk_get_dev_info(struct erofs_ublk_dev *dev, int dev_id)
+{
+	struct ublksrv_ctrl_cmd cmd = {0};
+	int ret;
+
+	cmd.dev_id = dev_id;
+	cmd.queue_id = (__u16)-1;
+	cmd.len = sizeof(dev->dev_info);
+	cmd.addr = (__u64)(uintptr_t)&dev->dev_info;
+
+	ret = ublk_ctrl_cmd(dev->ctrl_fd, UBLK_U_CMD_GET_DEV_INFO, &cmd);
+	if (ret < 0)
+		erofs_err("GET_DEV_INFO failed: %s", strerror(-ret));
+
+	return ret;
+}
+
+/*
+ * Get device parameters (for recovery - restore device params)
+ */
+static int ublk_get_params(struct erofs_ublk_dev *dev)
+{
+	struct ublksrv_ctrl_cmd cmd = {0};
+	int ret;
+
+	dev->params.len = sizeof(dev->params);
+
+	cmd.dev_id = dev->dev_info.dev_id;
+	cmd.queue_id = (__u16)-1;
+	cmd.len = sizeof(dev->params);
+	cmd.addr = (__u64)(uintptr_t)&dev->params;
+
+	ret = ublk_dev_ctrl_cmd(dev, UBLK_U_CMD_GET_PARAMS, &cmd);
+	if (ret < 0)
+		erofs_err("GET_PARAMS failed: %s", strerror(-ret));
+
+	return ret;
 }
 
 /*
@@ -1541,6 +1629,244 @@ int erofs_ublk_set_sig_handler(struct erofs_ublk_dev *dev)
 #endif
 }
 
+int erofs_ublk_recover_dev(int dev_id,
+			   erofs_ublk_io_handler_t handler,
+			   void *handler_ctx,
+			   struct erofs_ublk_dev **pdev)
+{
+#ifndef HAVE_LIBURING
+	(void)dev_id;
+	(void)handler;
+	(void)handler_ctx;
+	(void)pdev;
+	return -EOPNOTSUPP;
+#else
+	struct erofs_ublk_dev *dev;
+	char cdev_path[64];
+	int i, ret;
+
+	if (dev_id < 0 || !pdev)
+		return -EINVAL;
+
+	dev = calloc(1, sizeof(*dev));
+	if (!dev)
+		return -ENOMEM;
+
+	dev->handler = handler;
+	dev->handler_ctx = handler_ctx;
+	dev->ctrl_fd = -1;
+	dev->cdev_fd = -1;
+	dev->stop_efd = -1;
+	dev->ready_fd = -1;
+	dev->async_enabled = 0;
+
+	/* Open control device */
+	dev->ctrl_fd = open(UBLK_CTRL_DEV, O_RDWR);
+	if (dev->ctrl_fd < 0) {
+		ret = -errno;
+		erofs_err("Failed to open %s: %s", UBLK_CTRL_DEV,
+			  strerror(errno));
+		goto err_free;
+	}
+
+	/* Initialize persistent control ring */
+	ret = ublk_ctrl_ring_init(&dev->ctrl_ring);
+	if (ret < 0) {
+		erofs_err("ctrl ring init failed: %s", strerror(-ret));
+		goto err_close_ctrl;
+	}
+	dev->ctrl_ring_initialized = 1;
+
+	/* Create stop eventfd */
+	dev->stop_efd = eventfd(0, EFD_CLOEXEC);
+	if (dev->stop_efd < 0)
+		erofs_dbg("stop eventfd creation failed: %s",
+			  strerror(errno));
+
+	/* Get existing device info */
+	ret = ublk_get_dev_info(dev, dev_id);
+	if (ret < 0)
+		goto err_close_ctrl;
+
+	/* Check if device supports recovery */
+	if (!(dev->dev_info.flags & UBLK_F_USER_RECOVERY)) {
+		erofs_err("Device %d does not support user recovery", dev_id);
+		ret = -EOPNOTSUPP;
+		goto err_close_ctrl;
+	}
+
+	/* Check if device is quiesced (ready for recovery) */
+	if (dev->dev_info.state != UBLK_S_DEV_QUIESCED &&
+	    dev->dev_info.state != UBLK_S_DEV_FAIL_IO) {
+		erofs_err("Device %d is not in recoverable state (state=%d)",
+			  dev_id, dev->dev_info.state);
+		ret = -EBUSY;
+		goto err_close_ctrl;
+	}
+
+	/* Get device parameters before starting recovery */
+	ret = ublk_get_params(dev);
+	if (ret < 0)
+		goto err_close_ctrl;
+
+	/* Start recovery process */
+	ret = ublk_start_recovery(dev);
+	if (ret < 0)
+		goto err_close_ctrl;
+
+	/* Open char device */
+	snprintf(cdev_path, sizeof(cdev_path), UBLK_CDEV_FMT, dev_id);
+	dev->cdev_fd = open(cdev_path, O_RDWR);
+	if (dev->cdev_fd < 0) {
+		ret = -errno;
+		erofs_err("Failed to open %s: %s", cdev_path, strerror(errno));
+		goto err_close_ctrl;
+	}
+
+	/* Allocate queues */
+	dev->queues = calloc(dev->dev_info.nr_hw_queues,
+			     sizeof(struct erofs_ublk_queue));
+	if (!dev->queues) {
+		ret = -ENOMEM;
+		goto err_close_cdev;
+	}
+
+	/* Initialize queues */
+	for (i = 0; i < dev->dev_info.nr_hw_queues; i++) {
+		ret = ublk_init_queue(dev, i);
+		if (ret < 0)
+			goto err_cleanup_queues;
+	}
+
+	*pdev = dev;
+	return 0;
+
+err_cleanup_queues:
+	for (i = i - 1; i >= 0; i--)
+		ublk_cleanup_queue(dev, i);
+	free(dev->queues);
+err_close_cdev:
+	close(dev->cdev_fd);
+err_close_ctrl:
+	close(dev->ctrl_fd);
+err_free:
+	free(dev);
+	return ret;
+#endif
+}
+
+int erofs_ublk_complete_recovery(struct erofs_ublk_dev *dev)
+{
+#ifndef HAVE_LIBURING
+	(void)dev;
+	return -EOPNOTSUPP;
+#else
+	pthread_barrier_t init_barrier;
+	int i, ret;
+
+	if (!dev)
+		return -EINVAL;
+
+	/* Apply OOM protection */
+	if (!(dev->dev_info.flags & UBLK_F_UNPRIVILEGED_DEV))
+		ublk_apply_oom_protection();
+
+	/* Initialize barrier: nr_hw_queues threads + 1 main thread */
+	ret = pthread_barrier_init(&init_barrier,
+				   NULL, dev->dev_info.nr_hw_queues + 1);
+	if (ret) {
+		erofs_err("pthread_barrier_init failed: %s", strerror(ret));
+		return -ret;
+	}
+
+	/* Start queue threads */
+	for (i = 0; i < dev->dev_info.nr_hw_queues; i++) {
+		dev->queues[i].init_barrier = &init_barrier;
+		ret = pthread_create(&dev->queues[i].thread, NULL,
+				     ublk_queue_thread, &dev->queues[i]);
+		if (ret) {
+			erofs_err("pthread_create failed: %s", strerror(ret));
+			goto err_stop_threads;
+		}
+	}
+
+	/* Wait for all queue threads to finish initialization */
+	pthread_barrier_wait(&init_barrier);
+	pthread_barrier_destroy(&init_barrier);
+	for (i = 0; i < dev->dev_info.nr_hw_queues; i++)
+		dev->queues[i].init_barrier = NULL;
+
+	/* Complete recovery */
+	ret = ublk_end_recovery(dev);
+	if (ret < 0)
+		goto err_stop_threads;
+
+	dev->running = 1;
+	erofs_info("ublk device recovery completed successfully");
+
+	/* Wait for stop signal via eventfd (blocking, no polling) */
+	if (dev->stop_efd >= 0) {
+		uint64_t val;
+
+		while (!dev->stop_requested) {
+			if (read(dev->stop_efd, &val, sizeof(val)) < 0) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			break;
+		}
+	} else {
+		while (!dev->stop_requested)
+			usleep(100000);
+	}
+
+	return 0;
+
+err_stop_threads:
+	pthread_barrier_destroy(&init_barrier);
+	for (i = 0; i < dev->dev_info.nr_hw_queues; i++) {
+		dev->queues[i].init_barrier = NULL;
+		if (dev->queues[i].thread) {
+			dev->queues[i].state |= UBLKSRV_QUEUE_STOPPING;
+			pthread_join(dev->queues[i].thread, NULL);
+			dev->queues[i].thread = 0;
+		}
+	}
+	return ret;
+#endif
+}
+
+int erofs_ublk_is_recoverable(int dev_id)
+{
+#ifndef HAVE_LIBURING
+	(void)dev_id;
+	return 0;
+#else
+	struct erofs_ublk_dev dev;
+	int ctrl_fd, ret;
+
+	ctrl_fd = open(UBLK_CTRL_DEV, O_RDWR);
+	if (ctrl_fd < 0)
+		return 0;
+
+	memset(&dev, 0, sizeof(dev));
+	dev.ctrl_fd = ctrl_fd;
+
+	ret = ublk_get_dev_info(&dev, dev_id);
+	close(ctrl_fd);
+
+	if (ret < 0)
+		return 0;
+
+	/* Check if device supports recovery and is quiesced */
+	if ((dev.dev_info.flags & UBLK_F_USER_RECOVERY) &&
+	    dev.dev_info.state == UBLK_S_DEV_QUIESCED)
+		return 1;
+
+	return 0;
+#endif
+}
 
 /*
  * Async IO API implementations

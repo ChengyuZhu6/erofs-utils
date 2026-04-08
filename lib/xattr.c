@@ -1515,6 +1515,39 @@ int erofs_xattr_set_ishare_prefix(struct erofs_sb_info *sbi,
 	return 0;
 }
 
+char *erofs_xattr_build_ishare_name(struct erofs_sb_info *sbi)
+{
+	struct erofs_xattr_prefix_item *pf;
+	unsigned int idx, base_index;
+	const char *base;
+	size_t base_len, total;
+	char *name;
+
+	if (!erofs_sb_has_ishare_xattrs(sbi))
+		return NULL;
+
+	idx = sbi->ishare_xattr_prefix_id & EROFS_XATTR_LONG_PREFIX_MASK;
+	if (idx >= sbi->xattr_prefix_count)
+		return NULL;
+
+	pf = &sbi->xattr_prefixes[idx];
+	base_index = pf->prefix->base_index;
+	if (!base_index || base_index >= ARRAY_SIZE(xattr_types))
+		return NULL;
+
+	base = xattr_types[base_index].prefix;
+	base_len = xattr_types[base_index].prefix_len;
+	total = base_len + pf->infix_len + 1;
+	name = malloc(total);
+	if (!name)
+		return NULL;
+
+	memcpy(name, base, base_len);
+	memcpy(name + base_len, pf->prefix->infix, pf->infix_len);
+	name[total - 1] = '\0';
+	return name;
+}
+
 void erofs_xattr_cleanup_name_prefixes(void)
 {
 	struct ea_type_node *tnode, *n;

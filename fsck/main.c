@@ -15,6 +15,7 @@
 #include "erofs/xattr.h"
 #include "../lib/compressor.h"
 #include "../lib/liberofs_compress.h"
+#include "../lib/sha256.h"
 
 static int erofsfsck_check_inode(erofs_nid_t pnid, erofs_nid_t nid);
 
@@ -42,6 +43,8 @@ struct erofsfsck_cfg {
 	erofs_nid_t nid;
 	const char *inode_path;
 	bool nosbcrc;
+	bool verify_digest;
+	char *digest_xattr_name;
 };
 static struct erofsfsck_cfg fsckcfg;
 
@@ -64,6 +67,7 @@ static struct option long_options[] = {
 	{"nid", required_argument, 0, 15},
 	{"path", required_argument, 0, 16},
 	{"no-sbcrc", no_argument, 0, 512},
+	{"verify-digest", no_argument, 0, 17},
 	{0, 0, 0, 0},
 };
 
@@ -117,6 +121,8 @@ static void usage(int argc, char **argv)
 		" --nid=#                check or extract from the target inode of nid #\n"
 		" --path=X               check or extract from the target inode of path X\n"
 		" --no-sbcrc             bypass the superblock checksum verification\n"
+		" --verify-digest        verify per-file SHA-256 digests embedded by\n"
+		"                        mkfs.erofs --xattr-inode-digest\n"
 		" --[no-]xattrs          whether to dump extended attributes (default off)\n"
 		"\n"
 		" -a, -A, -y             no-op, for compatibility with fsck of other filesystems\n"
@@ -256,6 +262,10 @@ static int erofsfsck_parse_options_cfg(int argc, char **argv)
 			break;
 		case 16:
 			fsckcfg.inode_path = optarg;
+			break;
+		case 17:
+			fsckcfg.verify_digest = true;
+			fsckcfg.check_decomp = true;
 			break;
 		case 512:
 			fsckcfg.nosbcrc = true;
@@ -503,7 +513,8 @@ out:
 	return ret;
 }
 
-static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
+static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd,
+				   struct sha256_state *digest)
 {
 	struct erofs_map_blocks map = {
 		.buf = __EROFS_BUF_INITIALIZER,
@@ -546,11 +557,24 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 		if (map.m_la >= inode->i_size || !needdecode)
 			continue;
 
-		if (outfd >= 0 && !(map.m_flags & EROFS_MAP_MAPPED)) {
-			ret = lseek(outfd, map.m_llen, SEEK_CUR);
-			if (ret < 0) {
-				ret = -errno;
-				goto out;
+		if (!(map.m_flags & EROFS_MAP_MAPPED)) {
+			if (digest) {
+				static const char zeros[4096];
+				u64 remain = map.m_llen;
+
+				while (remain > 0) {
+					u64 chunk = remain > sizeof(zeros) ?
+						    sizeof(zeros) : remain;
+					erofs_sha256_process(digest,
+						(const u8 *)zeros, chunk);
+					remain -= chunk;
+				}
+			} else if (outfd >= 0) {
+				ret = lseek(outfd, map.m_llen, SEEK_CUR);
+				if (ret < 0) {
+					ret = -errno;
+					goto out;
+				}
 			}
 			continue;
 		}
@@ -596,6 +620,9 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 			if (ret)
 				goto out;
 
+			if (digest)
+				erofs_sha256_process(digest,
+					(const u8 *)buffer, map.m_llen);
 			if (outfd >= 0 && write(outfd, buffer, map.m_llen) < 0)
 				goto fail_eio;
 		} else {
@@ -609,6 +636,9 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 				if (ret)
 					goto out;
 
+				if (digest)
+					erofs_sha256_process(digest,
+						(const u8 *)raw, count);
 				if (outfd >= 0 && write(outfd, raw, count) < 0)
 					goto fail_eio;
 				map.m_llen -= count;
@@ -643,7 +673,7 @@ static inline int erofs_extract_dir(struct erofs_inode *inode)
 	erofs_dbg("create directory %s", fsckcfg.extract_path);
 
 	/* verify data chunk layout */
-	ret = erofs_verify_inode_data(inode, -1);
+	ret = erofs_verify_inode_data(inode, -1, NULL);
 	if (ret)
 		return ret;
 
@@ -739,7 +769,8 @@ static void erofsfsck_hardlink_exit(void)
 	}
 }
 
-static inline int erofs_extract_file(struct erofs_inode *inode)
+static inline int erofs_extract_file(struct erofs_inode *inode,
+				     struct sha256_state *digest)
 {
 	bool tryagain = true;
 	int ret, fd;
@@ -775,7 +806,7 @@ again:
 	}
 
 	/* verify data chunk layout */
-	ret = erofs_verify_inode_data(inode, fd);
+	ret = erofs_verify_inode_data(inode, fd, digest);
 	close(fd);
 	return ret;
 }
@@ -790,7 +821,7 @@ static inline int erofs_extract_symlink(struct erofs_inode *inode)
 	erofs_dbg("extract symlink to path: %s", fsckcfg.extract_path);
 
 	/* verify data chunk layout */
-	ret = erofs_verify_inode_data(inode, -1);
+	ret = erofs_verify_inode_data(inode, -1, NULL);
 	if (ret)
 		return ret;
 
@@ -844,7 +875,7 @@ static int erofs_extract_special(struct erofs_inode *inode)
 	erofs_dbg("extract special to path: %s", fsckcfg.extract_path);
 
 	/* verify data chunk layout */
-	ret = erofs_verify_inode_data(inode, -1);
+	ret = erofs_verify_inode_data(inode, -1, NULL);
 	if (ret)
 		return ret;
 
@@ -925,15 +956,81 @@ static int erofsfsck_dirent_iter(struct erofs_dir_context *ctx)
 	return ret;
 }
 
+static int erofsfsck_compute_digest(struct erofs_inode *inode,
+				    int fd, u8 *out)
+{
+	struct sha256_state md;
+	int ret;
+
+	erofs_sha256_init(&md);
+	ret = erofs_verify_inode_data(inode, fd, &md);
+	if (!ret)
+		erofs_sha256_done(&md, out);
+	return ret;
+}
+
+static int erofsfsck_verify_file_digest(struct erofs_inode *inode,
+					const u8 *computed_digest)
+{
+	u8 stored[32 + EROFS_SHA256_PREFIX_LEN];
+	u8 computed[32];
+	const u8 *digest = computed_digest;
+	int ret;
+
+	ret = erofs_getxattr(inode, fsckcfg.digest_xattr_name,
+			     (char *)stored, sizeof(stored));
+	if (ret == -ENODATA) {
+		erofs_warn("no digest xattr for nid %llu, skipped",
+			   inode->nid | 0ULL);
+		return 0;
+	}
+	if (ret < 0)
+		return ret;
+	if (ret != sizeof(stored) ||
+	    strncmp((const char *)stored, EROFS_SHA256_PREFIX, EROFS_SHA256_PREFIX_LEN)) {
+		erofs_err("malformed digest xattr @ nid %llu (size=%d)",
+			  inode->nid | 0ULL, ret);
+		return -EFSCORRUPTED;
+	}
+
+	if (!digest) {
+		ret = erofsfsck_compute_digest(inode, -1, computed);
+		if (ret)
+			return ret;
+		digest = computed;
+	}
+
+	if (memcmp(digest, stored + EROFS_SHA256_PREFIX_LEN, 32)) {
+		erofs_err("digest MISMATCH @ nid %llu",
+			  inode->nid | 0ULL);
+		return -EFSCORRUPTED;
+	}
+	return 0;
+}
+
 static int erofsfsck_extract_inode(struct erofs_inode *inode)
 {
+	u8 computed_digest[32];
+	bool has_digest = false;
 	int ret;
 	char *oldpath;
 
 	if (!fsckcfg.extract_path || erofs_is_packed_inode(inode)) {
 verify:
 		/* verify data chunk layout */
-		return erofs_verify_inode_data(inode, -1);
+		if (fsckcfg.verify_digest &&
+		    S_ISREG(inode->i_mode) && inode->i_size > 0) {
+			ret = erofsfsck_compute_digest(inode, -1,
+						       computed_digest);
+			if (ret)
+				return ret;
+			has_digest = true;
+		} else {
+			ret = erofs_verify_inode_data(inode, -1, NULL);
+			if (ret)
+				return ret;
+		}
+		goto check_digest;
 	}
 
 	oldpath = erofsfsck_hardlink_find(inode->nid);
@@ -950,9 +1047,21 @@ verify:
 	case S_IFDIR:
 		ret = erofs_extract_dir(inode);
 		break;
-	case S_IFREG:
-		ret = erofs_extract_file(inode);
+	case S_IFREG: {
+		struct sha256_state md;
+
+		if (fsckcfg.verify_digest && inode->i_size > 0) {
+			erofs_sha256_init(&md);
+			ret = erofs_extract_file(inode, &md);
+			if (!ret) {
+				erofs_sha256_done(&md, computed_digest);
+				has_digest = true;
+			}
+		} else {
+			ret = erofs_extract_file(inode, NULL);
+		}
 		break;
+	}
 	case S_IFLNK:
 		ret = erofs_extract_symlink(inode);
 		break;
@@ -969,11 +1078,21 @@ verify:
 	}
 	if (ret && ret != -ECANCELED)
 		return ret;
+	if (ret == -ECANCELED && fsckcfg.verify_digest)
+		return ret;
 
 	/* record nid and old path for hardlink */
 	if (inode->i_nlink > 1 && !S_ISDIR(inode->i_mode))
 		ret = erofsfsck_hardlink_insert(inode->nid,
 						fsckcfg.extract_path);
+	if (ret)
+		return ret;
+
+check_digest:
+	if (fsckcfg.verify_digest &&
+	    S_ISREG(inode->i_mode) && inode->i_size > 0)
+		ret = erofsfsck_verify_file_digest(inode,
+						   has_digest ? computed_digest : NULL);
 	return ret;
 }
 
@@ -1096,6 +1215,18 @@ int main(int argc, char *argv[])
 		goto exit_put_super;
 	}
 
+	if (fsckcfg.verify_digest) {
+		fsckcfg.digest_xattr_name =
+			erofs_xattr_build_ishare_name(&g_sbi);
+		if (!fsckcfg.digest_xattr_name) {
+			erofs_err("image has no inode digest xattrs (was --xattr-inode-digest used during mkfs?)");
+			err = -ENODATA;
+			goto exit_put_super;
+		}
+		erofs_info("verifying digests using xattr \"%s\"",
+			   fsckcfg.digest_xattr_name);
+	}
+
 	if (fsckcfg.extract_path)
 		erofsfsck_hardlink_init();
 
@@ -1176,6 +1307,7 @@ exit_hardlink:
 	if (fsckcfg.extract_path)
 		erofsfsck_hardlink_exit();
 exit_put_super:
+	free(fsckcfg.digest_xattr_name);
 	erofs_put_super(&g_sbi);
 exit_dev_close:
 	erofs_dev_close(&g_sbi);

@@ -72,16 +72,6 @@ static struct erofs_dentry *erofs_rebuild_mkdir(struct erofs_inode *dir,
 	return d;
 }
 
-struct erofs_dentry *erofs_d_lookup(struct erofs_inode *dir, const char *name)
-{
-	struct erofs_dentry *d;
-
-	list_for_each_entry(d, &dir->i_subdirs, d_child)
-		if (!strcmp(d->name, name))
-			return d;
-	return NULL;
-}
-
 struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 		char *path, bool aufs, bool *whout, bool *opq, bool to_head)
 {

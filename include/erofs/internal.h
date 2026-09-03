@@ -204,6 +204,7 @@ EROFS_FEATURE_FUNCS(ishare_xattrs, compat, COMPAT_ISHARE_XATTRS)
 #define EROFS_I_Z_INITED	(1 << EROFS_I_Z_INITED_BIT)
 
 struct erofs_diskbuf;
+struct erofs_dentry;
 
 #define EROFS_INODE_DATA_SOURCE_NONE		0
 #define EROFS_INODE_DATA_SOURCE_LOCALPATH	1
@@ -221,6 +222,8 @@ enum erofs_idata_type {
 
 struct erofs_inode {
 	struct list_head i_hash, i_subdirs, i_xattrs;
+	struct erofs_dentry **d_ht;
+	unsigned int d_count, d_ht_mask;
 
 	union {
 		/* (erofsfuse) runtime flags */
@@ -366,6 +369,7 @@ static inline struct erofs_inode *erofs_parent_inode(struct erofs_inode *inode)
 #define EROFS_DENTRY_FLAG_FIXUP_PNID	0x02
 struct erofs_dentry {
 	struct list_head d_child;	/* child of parent list */
+	struct erofs_dentry *d_hash_next;
 	union {
 		struct erofs_inode *inode;
 		erofs_nid_t nid;

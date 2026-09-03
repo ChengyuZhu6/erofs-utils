@@ -146,6 +146,7 @@ unsigned int erofs_iput(struct erofs_inode *inode)
 	if (got >= 1)
 		return got;
 
+	free(inode->d_ht);
 	list_for_each_entry_safe(d, t, &inode->i_subdirs, d_child)
 		free(d);
 
@@ -171,6 +172,77 @@ unsigned int erofs_iput(struct erofs_inode *inode)
 	return 0;
 }
 
+#define EROFS_D_HT_MIN 32
+
+static unsigned int erofs_d_namehash(const char *name)
+{
+	unsigned int hash = 2166136261u;
+
+	while (*name)
+		hash = (hash ^ (unsigned char)*name++) * 16777619u;
+	return hash;
+}
+
+static int erofs_d_ht_rebuild(struct erofs_inode *dir, unsigned int mask)
+{
+	struct erofs_dentry **ht, *d;
+
+	ht = calloc(mask + 1, sizeof(*ht));
+	if (!ht)
+		return -ENOMEM;
+	list_for_each_entry(d, &dir->i_subdirs, d_child) {
+		unsigned int h = erofs_d_namehash(d->name) & mask;
+
+		d->d_hash_next = ht[h];
+		ht[h] = d;
+	}
+	free(dir->d_ht);
+	dir->d_ht = ht;
+	dir->d_ht_mask = mask;
+	return 0;
+}
+
+static void erofs_d_ht_add(struct erofs_inode *dir, struct erofs_dentry *d)
+{
+	unsigned int h = erofs_d_namehash(d->name) & dir->d_ht_mask;
+
+	d->d_hash_next = dir->d_ht[h];
+	dir->d_ht[h] = d;
+}
+
+static void erofs_d_ht_del(struct erofs_inode *dir, struct erofs_dentry *d)
+{
+	struct erofs_dentry **pp;
+
+	if (!dir->d_ht)
+		return;
+	pp = &dir->d_ht[erofs_d_namehash(d->name) & dir->d_ht_mask];
+	while (*pp) {
+		if (*pp == d) {
+			*pp = d->d_hash_next;
+			return;
+		}
+		pp = &(*pp)->d_hash_next;
+	}
+}
+
+struct erofs_dentry *erofs_d_lookup(struct erofs_inode *dir, const char *name)
+{
+	struct erofs_dentry *d;
+
+	if (dir->d_ht) {
+		for (d = dir->d_ht[erofs_d_namehash(name) & dir->d_ht_mask];
+		     d; d = d->d_hash_next)
+			if (!strcmp(d->name, name))
+				return d;
+		return NULL;
+	}
+	list_for_each_entry(d, &dir->i_subdirs, d_child)
+		if (!strcmp(d->name, name))
+			return d;
+	return NULL;
+}
+
 struct erofs_dentry *erofs_d_alloc(struct erofs_inode *parent,
 				   const char *name)
 {
@@ -193,6 +265,16 @@ struct erofs_dentry *erofs_d_alloc(struct erofs_inode *parent,
 	d->type = EROFS_FT_UNKNOWN;
 	d->flags = 0;
 	list_add_tail(&d->d_child, &parent->i_subdirs);
+	parent->d_count++;
+	if (!parent->d_ht) {
+		if (parent->d_count >= EROFS_D_HT_MIN)
+			(void)erofs_d_ht_rebuild(parent, EROFS_D_HT_MIN - 1);
+	} else if (parent->d_count > parent->d_ht_mask + 1) {
+		if (erofs_d_ht_rebuild(parent, ((parent->d_ht_mask + 1) << 1) - 1))
+			erofs_d_ht_add(parent, d);
+	} else {
+		erofs_d_ht_add(parent, d);
+	}
 	return d;
 }
 
@@ -1912,8 +1994,10 @@ bool erofs_dentry_is_wht(struct erofs_sb_info *sbi, struct erofs_dentry *d)
 	return false;
 }
 
-static void erofs_dentry_kill(struct erofs_dentry *d)
+static void erofs_dentry_kill(struct erofs_inode *dir, struct erofs_dentry *d)
 {
+	erofs_d_ht_del(dir, d);
+	dir->d_count--;
 	list_del(&d->d_child);
 	erofs_d_invalidate(d);
 	free(d);
@@ -1935,7 +2019,7 @@ static int erofs_prepare_dir_inode(const struct erofs_mkfs_btctx *ctx,
 	list_for_each_entry_safe(d, n, &dir->i_subdirs, d_child) {
 		if (is_dot_dotdot(d->name)) {
 			DBG_BUGON(1);
-			erofs_dentry_kill(d);
+			erofs_dentry_kill(dir, d);
 			continue;
 		}
 		i_nlink += (d->type == EROFS_FT_DIR);
@@ -1959,7 +2043,7 @@ static int erofs_prepare_dir_inode(const struct erofs_mkfs_btctx *ctx,
 			if (erofs_dentry_is_wht(sbi, d)) {
 				erofs_dbg("remove whiteout %s",
 					  d->inode->i_srcpath);
-				erofs_dentry_kill(d);
+				erofs_dentry_kill(dir, d);
 				--nr_subdirs;
 				continue;
 			}

@@ -321,38 +321,10 @@ AC_CHECK_FUNCS(m4_flatten([
 	sysconf
 	utimensat]))
 
-# Detect maximum block size if necessary
-AS_IF([test "x$MAX_BLOCK_SIZE" = "x"], [
-  AC_CACHE_CHECK([sysconf (_SC_PAGESIZE)], [erofs_cv_max_block_size],
-               AC_RUN_IFELSE([AC_LANG_PROGRAM(
-[[
-#include <unistd.h>
-#include <stdio.h>
-]],
-[[
-    int result;
-    FILE *f;
-
-    result = sysconf(_SC_PAGESIZE);
-    if (result < 0)
-	return 1;
-
-    f = fopen("conftest.out", "w");
-    if (!f)
-	return 1;
-
-    fprintf(f, "%d", result);
-    fclose(f);
-    return 0;
-]])],
-                             [erofs_cv_max_block_size=`cat conftest.out`],
-                             [erofs_cv_max_block_size=4096],
-                             [erofs_cv_max_block_size=4096]))
-  dnl Ensure aarch64 supports at least 16K
-  AS_CASE([$build_cpu],
-    [aarch64*], [AS_IF([test "$erofs_cv_max_block_size" -lt 16384],
-                   [erofs_cv_max_block_size=16384])])
-], [erofs_cv_max_block_size=$MAX_BLOCK_SIZE])
+# Image support must not depend on the build host's page size.
+AS_IF([test "x$MAX_BLOCK_SIZE" = "x"],
+      [erofs_cv_max_block_size=65536],
+      [erofs_cv_max_block_size=$MAX_BLOCK_SIZE])
 
 # Configure multi-threading support
 AS_IF([test "x$enable_multithreading" != "xno"], [

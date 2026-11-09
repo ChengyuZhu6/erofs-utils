@@ -19,6 +19,11 @@ For build and installation instructions, see:
 
   docs/INSTALL.md
 
+For shared images across Linux guest page sizes and the large-block DAX
+prototype's development, testing and usage procedure, see:
+
+  docs/LARGE_BLOCK_DAX.md
+
 Contributing
 ------------
 

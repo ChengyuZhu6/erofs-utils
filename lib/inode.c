@@ -214,6 +214,13 @@ int erofs_allocate_inode_bh_data(struct erofs_inode *inode, erofs_blk_t nblocks,
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
+	/* Keep metadata out of the aligned data tail. */
+	if (S_ISREG(inode->i_mode) && !is_inode_layout_compression(inode) &&
+	    bmgr->dsunit > 1)
+		bh->block->buffers.nblocks = max_t(erofs_blk_t,
+			bh->block->buffers.nblocks,
+			roundup(BLK_ROUND_UP(sbi, inode->i_size), bmgr->dsunit));
+
 	bh->op = &erofs_skip_write_bhops;
 	inode->bh_data = bh;
 
@@ -1189,6 +1196,18 @@ static int erofs_write_tail_end(struct erofs_importer *im,
 out:
 	/* now bh_data can drop directly */
 	if (bh) {
+		struct erofs_bufmgr *bmgr = bh->block->buffers.fsprivate;
+		erofs_off_t end = erofs_btell(bh, true);
+		erofs_off_t reserved_end = erofs_pos(sbi, bh->block->blkaddr +
+						 bh->block->buffers.nblocks);
+		int ret;
+
+		if (S_ISREG(inode->i_mode) && !is_inode_layout_compression(inode) &&
+		    bmgr->dsunit > 1 && end < reserved_end) {
+			ret = erofs_io_fallocate(bmgr->vf, end, reserved_end - end, true);
+			if (ret)
+				return ret;
+		}
 		/*
 		 * Don't leave DATA buffers which were written in the global
 		 * buffer list. It will make balloc() slowly.
@@ -1596,9 +1615,10 @@ static int erofs_mkfs_handle_nondirectory(const struct erofs_mkfs_btctx *btctx,
 	}
 	if (ret)
 		return ret;
-	erofs_prepare_inode_buffer(btctx->im, inode);
-	erofs_write_tail_end(btctx->im, inode);
-	return 0;
+	ret = erofs_prepare_inode_buffer(btctx->im, inode);
+	if (ret)
+		return ret;
+	return erofs_write_tail_end(btctx->im, inode);
 }
 
 static int erofs_mkfs_create_directory(const struct erofs_mkfs_btctx *ctx,
@@ -1673,7 +1693,9 @@ static int erofs_mkfs_jobfn(const struct erofs_mkfs_btctx *ctx,
 		ret = erofs_write_dir_file(ctx->im, inode);
 		if (ret)
 			return ret;
-		erofs_write_tail_end(ctx->im, inode);
+		ret = erofs_write_tail_end(ctx->im, inode);
+		if (ret)
+			return ret;
 		inode->bh->op = &erofs_write_inode_bhops;
 		erofs_iput(inode);
 		return 0;
@@ -2445,8 +2467,12 @@ struct erofs_inode *erofs_mkfs_build_special_from_fd(struct erofs_importer *im,
 	if (ret)
 		return ERR_PTR(ret);
 out:
-	erofs_prepare_inode_buffer(im, inode);
-	erofs_write_tail_end(im, inode);
+	ret = erofs_prepare_inode_buffer(im, inode);
+	if (ret)
+		return ERR_PTR(ret);
+	ret = erofs_write_tail_end(im, inode);
+	if (ret)
+		return ERR_PTR(ret);
 	return inode;
 }
 

@@ -1092,7 +1092,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		case 'b':
 			err = erofs_mkfs_strtol(optarg, &endptr, &i, 0);
 			if (err || *endptr != '\0' || i < 512 ||
-			    i > EROFS_MAX_BLOCK_SIZE) {
+			    i > EROFS_MAX_BLOCK_SIZE || (i & (i - 1))) {
 				erofs_err("invalid block size %s", optarg);
 				return -EINVAL;
 			}

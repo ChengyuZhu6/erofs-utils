@@ -35,7 +35,7 @@ typedef unsigned short umode_t;
 #endif
 
 #ifndef EROFS_MAX_BLOCK_SIZE
-#define EROFS_MAX_BLOCK_SIZE	4096
+#define EROFS_MAX_BLOCK_SIZE	65536
 #endif
 
 #define EROFS_ISLOTBITS		5

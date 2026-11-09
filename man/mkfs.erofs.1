@@ -35,7 +35,11 @@ other EROFS image(s), see \fIREBUILD MODE\fR below
 .BI "\-b " block-size
 Set the fundamental block size of the filesystem in bytes.  In other words,
 specify the smallest amount of data that can be accessed at a time.  The
-default is the system page size.  It cannot be less than 512 bytes.
+default is the smaller of the system page size and the configured maximum.
+The size must be a power of two, at least 512 bytes and no larger than the
+configured maximum (65536 bytes by default, independent of the build host).
+Blocks larger than the target kernel's page size require large-block EROFS
+support; consult docs/LARGE_BLOCK_DAX.md for the prototype's supported layouts.
 .TP
 .BI "\-C " max-pcluster-size
 Specify the maximum size of compress physical cluster in bytes.
@@ -255,6 +259,9 @@ the output filesystem, with no leading /.
 .TP
 .BI "\-\-dsunit=" #
 Align all data block addresses to multiples of #.
+Non-inlined, uncompressed regular files also reserve zero-filled padding up to
+this alignment.  Together with \fI-E ^inline_data\fR, \fI-b 4096 --dsunit=4\fR
+can prepare files for 16KiB-page DAX on kernels supporting sub-page DAX.
 
 If \fI--dsunit\fR and \fI--chunksize\fR are both set, \fI--dsunit\fR will be
 ignored if it is larger than \fI--chunksize\fR.
